@@ -104,13 +104,19 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         if (connecting?.isActive == true) return
         connecting = viewModelScope.launch {
             mutable.update { it.copy(connecting = true) }
+            // Keep the real reason. "服务未连接" on its own made a healthy
+            // service look broken when the real fault was elsewhere.
+            var lastFailure = "尚未尝试连接"
+            var failure = { value: String -> lastFailure = value }
             try {
-                var health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                var health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
+                    .onFailure { failure(describe(it)) }.getOrNull()
                 if (health == null && start) {
                     TermuxConnection.bootstrap(getApplication(), token)
                     for (attempt in 0 until 30) {
                         delay(500)
-                        health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                        health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
+                            .onFailure { failure(describe(it)) }.getOrNull()
                         if (health != null) break
                     }
                 }
@@ -119,19 +125,28 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                     health = null
                     for (attempt in 0 until 40) {
                         delay(500)
-                        val next = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                        val next = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
+                            .onFailure { failure(describe(it)) }.getOrNull()
                         if (next?.string("version") == BRIDGE_VERSION) { health = next; break }
                     }
                 }
                 if (health != null) {
-                    val workspaces = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
-                    mutable.update { it.copy(connected = true, health = health, workspaces = workspaces) }
+                    // Mark connected before listing workspaces: the health call is
+                    // the real proof the service is up, and a failure while listing
+                    // must not leave the UI claiming the service is unreachable.
+                    mutable.update { it.copy(connected = true, health = health) }
+                    val workspaces = runCatching {
+                        withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+                    }.onFailure { failure(describe(it)) }.getOrDefault(state.value.workspaces)
+                    mutable.update { it.copy(workspaces = workspaces) }
                     if (state.value.selected == null && workspaces.isNotEmpty()) select(workspaces.first())
                 } else {
                     mutable.update { it.copy(connected = false) }
-                    if (start) error("服务未连接。请检查 Termux 权限、外部应用设置，以及 Node / Python 是否安装。")
+                    if (start) error("本地服务无响应（$lastFailure）。若 Termux 显示" +
+                        "\"local service already running\"，说明服务在跑但 App 连不上；" +
+                        "请确认 Termux 未被系统杀死，或在 Termux 执行 pkill -f server.mjs 后重试。")
                 }
-            } catch (e: Exception) { error(e.message ?: "连接失败") }
+            } catch (e: Exception) { error(describe(e)) }
             finally { mutable.update { it.copy(connecting = false) } }
         }
     }

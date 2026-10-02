@@ -379,6 +379,9 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
 private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () -> Unit, safe: (() -> Unit) -> Unit) {
     val context = LocalContext.current
     val result by TermuxConnection.lastResult.collectAsStateWithLifecycle()
+    // Compare against the real constant. A hardcoded "0.2.0" here made the button
+    // read 更新本地服务 forever, even on a current service.
+    val needsUpdate = state.health?.string("version") != BRIDGE_VERSION
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Text("本地环境", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Text("DSH 和命令运行在手机上的完整 Termux 中。", color = Color(0xFF64748B))
@@ -398,9 +401,9 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 }
                 Button(onClick = { model.connect() }, enabled = !state.connecting) {
                     if (state.connecting) { CircularProgressIndicator(Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)) }
-                    Text(if (state.connecting) "正在连接…" else if (state.connected && state.health?.string("version") != "0.2.0") "更新本地服务" else if (state.connected) "刷新状态" else "启动本地服务")
+                    Text(if (state.connecting) "正在连接…" else if (state.connected && needsUpdate) "更新本地服务" else if (state.connected) "刷新状态" else "启动本地服务")
                 }
-                if (state.connected && state.health?.string("version") != "0.2.0") Text("更新会结束本应用的终端连接，保留工作区和对话记录。", style = MaterialTheme.typography.bodySmall)
+                if (state.connected && needsUpdate) Text("本地服务版本落后，将自动更新。更新会结束终端连接，保留工作区和对话记录。", style = MaterialTheme.typography.bodySmall)
                 state.health?.let { health -> Text("${health.string("arch")} · Node ${health.string("node")}\n${health.string("home")}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace) }
                 if (result.isNotBlank()) SelectionContainer { Text(result, style = MaterialTheme.typography.bodySmall, modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState())) }
             }
@@ -411,6 +414,7 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 Text(if (state.health?.string("dsh").isNullOrBlank()) "尚未检测到引擎" else "已发现 DSH · SDK 模式", color = Color(0xFF64748B))
                 Text("开发版先使用 DSH 的 sdk-minimal 配置，提供持久 Shell 和会话。模型可通过 Shell 读写代码、运行工具。", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text("安装 / 检查 Android 引擎") }
+                OutlinedButton(onClick = { safe { TermuxConnection.diagnose(context) } }) { Text("诊断本地服务连接") }
                 OutlinedButton(onClick = { safe { TermuxConnection.openTerminal(context, state.selected?.path ?: TermuxConnection.HOME) } }) { Text("打开原生 Termux 终端") }
             }
         }

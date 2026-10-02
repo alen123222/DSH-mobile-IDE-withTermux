@@ -12,7 +12,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.3.1"
+const val BRIDGE_VERSION = "0.3.3"
 
 class BridgeApi(internal val token: String) {
     // Listing shared storage over Android's FUSE mount can take tens of seconds
@@ -42,6 +42,22 @@ class BridgeApi(internal val token: String) {
 }
 
 data class StreamFrame(val chat: JSONObject?, val deleted: Boolean)
+
+/** Turn a transport failure into something a user can act on. */
+fun describe(error: Throwable): String {
+    val type = error.javaClass.simpleName
+    val detail = error.message.orEmpty()
+    return when {
+        detail.contains("Failed to connect", true) || detail.contains("ECONNREFUSED", true) ->
+            "端口 8765 无监听，Termux 服务未运行"
+        detail.contains("timeout", true) || detail.contains("SocketTimeout", true) ->
+            "连接超时，Termux 可能已被系统杀死"
+        detail.contains("CLEARTEXT", true) -> "明文 HTTP 被系统策略拦截"
+        detail.contains("401", true) || detail.contains("密钥", true) -> "配对密钥不匹配"
+        detail.isBlank() -> type
+        else -> "$type: $detail"
+    }
+}
 
 /** One SSE channel. Returns the Call so the caller can cancel it. */
 fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () -> Unit): Call {
