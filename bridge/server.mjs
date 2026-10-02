@@ -1,0 +1,95 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { ApiError, safeEqual, writeJson, readJson, executable } from './util.mjs';
+import { Workspaces } from './workspaces.mjs';
+import { Terminals } from './terminals.mjs';
+import { DshSessions } from './dsh.mjs';
+
+async function bodyOf(request) {
+  if (!request.headers['content-type']?.startsWith('application/json')) throw new ApiError(415, '请求必须为 JSON');
+  let size = 0; const chunks = [];
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 512 * 1024) throw new ApiError(413, '请求内容过大');
+    chunks.push(chunk);
+  }
+  try {
+    const result = JSON.parse(Buffer.concat(chunks).toString());
+    if (!result || Array.isArray(result) || typeof result !== 'object') throw new Error();
+    return result;
+  } catch { throw new ApiError(400, '无效的 JSON 请求'); }
+}
+
+export function createBridge({ stateDir, token, dshOptions = {} }) {
+  if (typeof token !== 'string' || token.length < 32) throw new Error('Bridge token must contain at least 32 characters');
+  const workspaces = new Workspaces(stateDir), terminals = new Terminals(), chats = new DshSessions(stateDir, dshOptions);
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const send = (status, data) => { res.writeHead(status); res.end(JSON.stringify(data)); };
+    try {
+      if (req.headers.origin) throw new ApiError(403, '浏览器来源不可调用本地执行服务');
+      if (!safeEqual(req.headers.authorization || '', `Bearer ${token}`)) throw new ApiError(401, '连接密钥不匹配，请重新连接 Termux');
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const parts = url.pathname.split('/').filter(Boolean);
+      const method = req.method;
+      if (parts[0] !== 'v1') throw new ApiError(404, '接口不存在');
+      const body = method === 'POST' ? await bodyOf(req) : {};
+      let result;
+      if (method === 'GET' && parts[1] === 'health') result = { version: '0.2.0', platform: process.platform, arch: process.arch,
+        home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
+        dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
+      else if (method === 'GET' && parts[1] === 'browse') result = workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
+      else if (method === 'POST' && parts[1] === 'directories') result = workspaces.create(body.parent, body.name);
+      else if (method === 'GET' && parts[1] === 'workspaces') result = { items: workspaces.all() };
+      else if (method === 'POST' && parts[1] === 'workspaces') result = workspaces.add(body.path);
+      else if (method === 'DELETE' && parts[1] === 'workspaces') { workspaces.remove(parts[2]); result = { ok: true }; }
+      else if (method === 'GET' && parts[1] === 'file') result = workspaces.read(url.searchParams.get('workspaceId'), url.searchParams.get('path'));
+      else if (method === 'POST' && parts[1] === 'terminals' && !parts[2]) result = terminals.open(workspaces.get(body.workspaceId));
+      else if (method === 'GET' && parts[1] === 'terminals') {
+        const after = Number(url.searchParams.get('after') || 0);
+        if (!Number.isSafeInteger(after) || after < 0) throw new ApiError(400, '无效的终端游标');
+        result = terminals.poll(parts[2], after);
+      } else if (method === 'POST' && parts[1] === 'terminals' && parts[2]) { terminals.write(parts[2], body); result = { ok: true }; }
+      else if (method === 'DELETE' && parts[1] === 'terminals') { terminals.close(parts[2]); result = { ok: true }; }
+      else if (method === 'GET' && parts[1] === 'chats' && !parts[2]) result = { items: chats.list(url.searchParams.get('workspaceId')) };
+      else if (method === 'POST' && parts[1] === 'chats' && !parts[2]) result = chats.create(workspaces.get(body.workspaceId));
+      else if (method === 'GET' && parts[1] === 'chats' && parts[2]) result = chats.snapshot(chats.get(parts[2]));
+      else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'prompt') result = await chats.prompt(parts[2], body);
+      else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'stop') result = chats.stop(parts[2]);
+      else throw new ApiError(404, '接口不存在');
+      send(200, result);
+    } catch (error) {
+      const status = error.status || ({ ENOENT: 404, EACCES: 403, EPERM: 403, EEXIST: 409 }[error.code]) || 500;
+      send(status, { error: error.message || '操作失败' });
+    }
+  });
+  server.requestTimeout = 15000;
+  server.headersTimeout = 10000;
+  server.on('close', () => { terminals.closeAll(); chats.closeAll(); });
+  return { server, workspaces, terminals, chats };
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  const stateDir = process.env.POCKET_HOME || path.join(os.homedir(), '.local', 'share', 'dsh-pocket');
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const configPath = path.join(stateDir, 'connection.json');
+  let config = readJson(configPath, null);
+  if (!config) { config = { token: crypto.randomBytes(32).toString('hex'), port: 8765 }; writeJson(configPath, config); }
+  const bridge = createBridge({ stateDir, token: config.token });
+  bridge.server.on('error', error => { console.error(`DSH Pocket: ${error.message}`); process.exitCode = 1; });
+  bridge.server.listen(config.port, '127.0.0.1', () => console.log(`DSH Pocket bridge listening on 127.0.0.1:${config.port}`));
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return; stopping = true;
+    bridge.terminals.closeAll(); bridge.chats.closeAll();
+    bridge.server.close(); bridge.server.closeAllConnections();
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on('SIGTERM', stop); process.on('SIGINT', stop);
+}

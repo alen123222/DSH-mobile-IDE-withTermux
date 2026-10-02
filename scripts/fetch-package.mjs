@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+const [name, version, filename] = process.argv.slice(2);
+const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`);
+if (!response.ok) throw new Error(`Package not found: ${name}@${version}`);
+const { dist } = await response.json();
+const data = Buffer.from(await (await fetch(dist.tarball)).arrayBuffer());
+const digest = `sha512-${crypto.createHash('sha512').update(data).digest('base64')}`;
+if (digest !== dist.integrity) throw new Error('Package integrity mismatch');
+fs.writeFileSync(filename, data);
+console.log(`${name}@${version}: verified`);

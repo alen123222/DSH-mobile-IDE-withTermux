@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'none'">
+<link rel="stylesheet" href="xterm.css">
+<style>html,body{height:100vh;margin:0;background:#111827;overflow:hidden}#terminal{position:fixed;inset:12px 8px;min-width:0;min-height:0}.xterm-viewport{scrollbar-width:none}</style>
+</head><body><div id="terminal"></div><script src="xterm.js"></script><script src="addon-fit.js"></script><script>
+const term=new Terminal({cursorBlink:true,fontSize:13,fontFamily:'monospace',scrollback:5000,theme:{background:'#111827',foreground:'#E5E7EB',cursor:'#93C5FD'},allowProposedApi:false});
+const container=document.getElementById('terminal');
+const fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(container);
+let ready=false,resizeFrame=0;
+term.onData(data=>PocketTerminal.input(data));
+term.onResize(size=>{if(ready&&validSize(size))PocketTerminal.resize(size.rows,size.cols)});
+function validSize(size){return size&&Number.isInteger(size.rows)&&Number.isInteger(size.cols)&&size.rows>=2&&size.cols>=2&&size.rows<=500&&size.cols<=500}
+function resize(){
+  try{
+    const proposed=fit.proposeDimensions();
+    if(!proposed||!Number.isFinite(proposed.rows)||!Number.isFinite(proposed.cols)||proposed.rows<2||proposed.cols<2)return;
+    const size={rows:Math.min(500,Math.floor(proposed.rows)),cols:Math.min(500,Math.floor(proposed.cols))};
+    if(term.rows!==size.rows||term.cols!==size.cols)term.resize(size.cols,size.rows);
+    if(!ready){ready=true;PocketTerminal.resize(size.rows,size.cols);PocketTerminal.ready()}
+  }catch(e){/* Retry after the native viewport and font metrics are available. */}
+}
+function scheduleResize(){if(!resizeFrame)resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;resize()})}
+new ResizeObserver(scheduleResize).observe(container);
+window.addEventListener('resize',scheduleResize);
+window.visualViewport?.addEventListener('resize',scheduleResize);
+document.fonts?.ready.then(scheduleResize);
+container.addEventListener('pointerdown',()=>term.focus());
+window.receiveBase64=data=>term.write(Uint8Array.from(atob(data),c=>c.charCodeAt(0)));
+window.terminalKey=data=>{PocketTerminal.input(data);term.focus()};
+window.terminalNotice=data=>term.writeln('\r\n\x1b[33m'+data+'\x1b[0m');
+scheduleResize();
+</script></body></html>

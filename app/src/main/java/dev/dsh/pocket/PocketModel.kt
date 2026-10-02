@@ -1,0 +1,233 @@
+package dev.dsh.pocket
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.util.UUID
+
+data class PocketState(
+    val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
+    val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
+    val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
+    val browserLoading: Boolean = false, val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
+    val settings: EngineSettings = EngineSettings(), val error: String? = null, val preview: JSONObject? = null,
+    val consent: Boolean = false, val terminalId: String? = null,
+    val presets: List<ApiPreset> = emptyList(), val activePresetId: String = "",
+    val apiChecking: Boolean = false, val apiModels: List<String> = emptyList(), val apiResult: String = "",
+)
+
+class PocketModel(application: Application) : AndroidViewModel(application) {
+    private val secrets = Secrets(application)
+    val token = secrets.token()
+    val api = BridgeApi(token)
+    private val savedPresets = secrets.presets()
+    private val mutable = MutableStateFlow(PocketState(settings = savedPresets.second.firstOrNull { it.id == savedPresets.first }?.settings ?: savedPresets.second.first().settings,
+        activePresetId = savedPresets.first, presets = savedPresets.second))
+    val state = mutable.asStateFlow()
+    private var monitor: Job? = null
+    private var connecting: Job? = null
+    private var selectionRevision = 0
+    private var browserRevision = 0
+    private var apiCheck: Job? = null
+    private var apiRevision = 0
+    private val providerClient = ProviderClient()
+
+    init { connect(false) }
+    fun dismissError() = mutable.update { it.copy(error = null) }
+    fun error(message: String) = mutable.update { it.copy(error = message) }
+    fun consent(value: Boolean) = mutable.update { it.copy(consent = value) }
+    fun savePreset(id: String?, name: String, settings: EngineSettings) {
+        try {
+            ProviderEndpoint.base(settings)
+            require(name.isNotBlank() && settings.model.isNotBlank()) { "请填写预设名称和模型 ID" }
+            val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route))
+            val items = state.value.presets.filterNot { it.id == preset.id } + preset
+            secrets.savePresets(preset.id, items)
+            invalidateApiCheck()
+            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = "已保存并启用；请在新会话中使用。") }
+        } catch (e: Exception) { error(e.message ?: "保存失败") }
+    }
+    fun selectPreset(id: String) {
+        val preset = state.value.presets.firstOrNull { it.id == id } ?: return
+        secrets.savePresets(id, state.value.presets)
+        invalidateApiCheck()
+        mutable.update { it.copy(activePresetId = id, settings = preset.settings) }
+    }
+    fun deletePreset(id: String) {
+        val items = state.value.presets.filterNot { it.id == id }
+        if (items.isEmpty()) { error("请至少保留一个预设"); return }
+        val active = items.firstOrNull { it.id == state.value.activePresetId } ?: items.first()
+        secrets.savePresets(active.id, items)
+        invalidateApiCheck()
+        mutable.update { it.copy(presets = items, activePresetId = active.id, settings = active.settings) }
+    }
+    fun invalidateApiCheck() {
+        apiRevision++
+        apiCheck?.cancel()
+        mutable.update { it.copy(apiChecking = false, apiModels = emptyList(), apiResult = "") }
+    }
+    fun checkApi(settings: EngineSettings, listModels: Boolean) {
+        val revision = ++apiRevision
+        apiCheck?.cancel()
+        mutable.update { it.copy(apiChecking = true, apiResult = if (listModels) "正在查询模型…" else "正在发送简短测试请求…", apiModels = emptyList()) }
+        apiCheck = viewModelScope.launch {
+            try {
+                if (listModels) {
+                    val models = withContext(Dispatchers.IO) { providerClient.models(settings) }
+                    if (revision == apiRevision) mutable.update { it.copy(apiModels = models, apiResult = "发现 ${models.size} 个模型。列表不代表每个模型均可调用，请选择后测试。") }
+                } else {
+                    val result = withContext(Dispatchers.IO) { providerClient.test(settings) }
+                    if (revision == apiRevision) mutable.update { it.copy(apiResult = result) }
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { if (revision == apiRevision) mutable.update { it.copy(apiResult = (e.message ?: "测试失败").let { message -> if (settings.apiKey.isNotEmpty()) message.replace(settings.apiKey, "[已隐藏]") else message }) } }
+            finally { if (revision == apiRevision) mutable.update { it.copy(apiChecking = false) } }
+        }
+    }
+    fun connect(start: Boolean = true) {
+        if (connecting?.isActive == true) return
+        connecting = viewModelScope.launch {
+            mutable.update { it.copy(connecting = true) }
+            try {
+                var health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                if (health == null && start) {
+                    TermuxConnection.bootstrap(getApplication(), token)
+                    for (attempt in 0 until 30) {
+                        delay(500)
+                        health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                        if (health != null) break
+                    }
+                }
+                if (health != null && health.string("version") != "0.2.0" && start) {
+                    TermuxConnection.upgrade(getApplication(), token)
+                    health = null
+                    for (attempt in 0 until 40) {
+                        delay(500)
+                        val next = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
+                        if (next?.string("version") == "0.2.0") { health = next; break }
+                    }
+                }
+                if (health != null) {
+                    val workspaces = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+                    mutable.update { it.copy(connected = true, health = health, workspaces = workspaces) }
+                    if (state.value.selected == null && workspaces.isNotEmpty()) select(workspaces.first())
+                } else {
+                    mutable.update { it.copy(connected = false) }
+                    if (start) error("服务未连接。请检查 Termux 权限、外部应用设置，以及 Node / Python 是否安装。")
+                }
+            } catch (e: Exception) { error(e.message ?: "连接失败") }
+            finally { mutable.update { it.copy(connecting = false) } }
+        }
+    }
+    private fun task(block: suspend () -> Unit) = viewModelScope.launch {
+        try { block() } catch (e: Exception) { error(e.message ?: "操作失败") }
+    }
+    fun select(workspace: Workspace) {
+        selectionRevision++
+        monitor?.cancel()
+        mutable.update { it.copy(selected = workspace, chat = null, chats = emptyList(), terminalId = null, consent = false, entries = emptyList(), browserPath = workspace.path) }
+        browse(workspace.path)
+        val revision = selectionRevision
+        task {
+            val chats = withContext(Dispatchers.IO) { api.call("chats", query = mapOf("workspaceId" to workspace.id)).objects("items") }
+            if (revision == selectionRevision) {
+                mutable.update { it.copy(chats = chats) }
+                chats.firstOrNull()?.let { openChat(it.getString("id")) }
+            }
+        }
+    }
+    fun browse(path: String = "", dirsOnly: Boolean = false) {
+        val revision = ++browserRevision
+        mutable.update { it.copy(browserLoading = true) }
+        task {
+            try {
+                val result = withContext(Dispatchers.IO) { api.call("browse", query = mapOf("path" to path, "dirs" to dirsOnly.toString())) }
+                if (revision == browserRevision) mutable.update { it.copy(browserPath = result.getString("path"), browserParent = result.getString("parent"), entries = result.objects("entries").map(FileEntry::from)) }
+            } finally { if (revision == browserRevision) mutable.update { it.copy(browserLoading = false) } }
+        }
+    }
+    fun addWorkspace(path: String) = task {
+        val workspace = withContext(Dispatchers.IO) { Workspace.from(api.call("workspaces", "POST", JSONObject().put("path", path))) }
+        val all = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+        mutable.update { it.copy(workspaces = all) }
+        select(workspace)
+    }
+    fun createDirectory(name: String) = task {
+        val parent = state.value.browserPath
+        withContext(Dispatchers.IO) { api.call("directories", "POST", JSONObject().put("parent", parent).put("name", name)) }
+        browse(parent)
+    }
+    fun preview(entry: FileEntry) = task {
+        val workspace = state.value.selected ?: return@task
+        val value = withContext(Dispatchers.IO) { api.call("file", query = mapOf("workspaceId" to workspace.id, "path" to entry.path)) }
+        mutable.update { it.copy(preview = value) }
+    }
+    fun closePreview() = mutable.update { it.copy(preview = null) }
+    fun newChat() = task {
+        val workspace = state.value.selected ?: return@task
+        val value = withContext(Dispatchers.IO) { api.call("chats", "POST", JSONObject().put("workspaceId", workspace.id)) }
+        if (state.value.selected?.id != workspace.id) return@task
+        mutable.update { it.copy(chat = value, chats = listOf(value) + it.chats, consent = false) }
+        monitor(value.getString("id"))
+    }
+    fun openChat(id: String) = task {
+        val workspaceId = state.value.selected?.id
+        val value = withContext(Dispatchers.IO) { api.call("chats/$id") }
+        if (value.string("workspaceId") != workspaceId || workspaceId != state.value.selected?.id) return@task
+        mutable.update { it.copy(chat = value, consent = false) }
+        monitor(id)
+    }
+    private fun monitor(id: String) {
+        monitor?.cancel()
+        monitor = viewModelScope.launch {
+            while (true) {
+                delay(900)
+                try {
+                    val chat = withContext(Dispatchers.IO) { api.call("chats/$id") }
+                    if (state.value.chat?.string("id") != id) return@launch
+                    mutable.update { it.copy(chat = chat, connected = true) }
+                } catch (e: Exception) {
+                    mutable.update { it.copy(connected = false) }
+                    delay(2000)
+                }
+            }
+        }
+    }
+    fun send(prompt: String) = task {
+        val state = state.value
+        val chat = state.chat ?: return@task
+        val settings = state.settings
+        val value = withContext(Dispatchers.IO) {
+            api.call("chats/${chat.getString("id")}/prompt", "POST", JSONObject().put("prompt", prompt)
+                .put("model", settings.model).put("provider", settings.route).put("apiKey", settings.apiKey)
+                .put("protocol", settings.protocol).put("autoVersion", settings.autoVersion)
+                .put("baseUrl", settings.baseUrl).put("allowExecution", state.consent))
+        }
+        if (mutable.value.chat?.string("id") == value.string("id")) mutable.update { it.copy(chat = value) }
+    }
+    fun stop() = task {
+        val id = state.value.chat?.string("id") ?: return@task
+        val value = withContext(Dispatchers.IO) { api.call("chats/$id/stop", "POST") }
+        if (mutable.value.chat?.string("id") == id) mutable.update { it.copy(chat = value) }
+    }
+    fun terminal() = task {
+        val workspace = state.value.selected ?: return@task
+        val value = withContext(Dispatchers.IO) { api.call("terminals", "POST", JSONObject().put("workspaceId", workspace.id)) }
+        if (state.value.selected?.id == workspace.id) mutable.update { it.copy(terminalId = value.getString("id")) }
+    }
+    fun closeTerminal() = task {
+        val id = state.value.terminalId ?: return@task
+        withContext(Dispatchers.IO) { api.call("terminals/$id", "DELETE") }
+        mutable.update { if (it.terminalId == id) it.copy(terminalId = null) else it }
+    }
+}

@@ -1,0 +1,5 @@
+# SDK-minimal already declares its execution policy. This only selects the
+# actual Termux Bash executable; it does not impersonate a Linux sandbox.
+- id: terminal-bash
+  config:
+    shellPath: !!js process.env.PREFIX + '/bin/bash'
