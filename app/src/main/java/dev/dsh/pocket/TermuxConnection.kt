@@ -55,11 +55,21 @@ object TermuxConnection {
             }
     }
 
+    // A fragment handed to RUN_COMMAND must end in a newline or it will be glued
+    // to whatever is appended next. Kotlin's trimIndent() also strips trailing
+    // blank lines, so wrap every such fragment in this instead of trusting it.
+    private fun String.asScriptBlock() = if (endsWith("\n")) this else this + "\n"
+
     // Launching the bridge used to be fire-and-forget: every reconnect ran a bare
     // `node server.mjs`, so a second launch while the first was alive died with
     // EADDRINUSE and the app could never reconnect again. The server now adopts a
     // healthy existing instance, and this script additionally detects a live
     // service before starting a duplicate.
+    //
+    // Every fragment appended to a RUN_COMMAND script must end in a newline.
+    // Kotlin's trimIndent() also drops trailing blank lines, so returning a
+    // bare raw string here glued `fi` to whatever came next and bash rejected
+    // the whole script with "unexpected end of file from `if`".
     private fun guardScript(token: String) = """
         export POCKET_TOKEN='$token'
         if node -e "
@@ -73,11 +83,11 @@ object TermuxConnection {
           echo 'Run in Termux: pkill -f server.mjs'
           exit 1
         fi
-    """.trimIndent()
+    """.trimIndent().asScriptBlock()
 
     fun bootstrap(context: Context, token: String) {
         val script = buildString {
-            append(assetsScript(context, listOf("bridge", "termux")))
+            append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
             val config = JSONObject().put("token", token).put("port", 8765).toString()
             val base64 = Base64.encodeToString(config.toByteArray(), Base64.NO_WRAP)
             append("printf '%s' '$base64' | base64 -d > \"\$ROOT/connection.json\"\n")
@@ -108,7 +118,7 @@ object TermuxConnection {
                 if (!stopped) throw new Error('现有服务未退出');
             """.trimIndent())
             append("\nPOCKET_UPDATE\nunset POCKET_UPDATE_TOKEN\n")
-            append(assetsScript(context, listOf("bridge", "termux")))
+            append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
             append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
         }
         run(context, script, true, "更新 DSH Pocket 本地服务")
