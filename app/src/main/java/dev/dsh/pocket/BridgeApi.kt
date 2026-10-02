@@ -12,11 +12,14 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.3.0"
+const val BRIDGE_VERSION = "0.3.1"
 
 class BridgeApi(internal val token: String) {
-    private val client = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS).callTimeout(15, TimeUnit.SECONDS).build()
+    // Listing shared storage over Android's FUSE mount can take tens of seconds
+    // on a phone full of photos. 12 s made the file browser grey out and time out
+    // on perfectly ordinary folders, so browse/directory work gets its own budget.
+    private val client = OkHttpClient.Builder().connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS).callTimeout(60, TimeUnit.SECONDS).build()
     // A separate client: the SSE channel must never inherit the 12 s read timeout.
     internal val streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS).retryOnConnectionFailure(true).build()
@@ -40,7 +43,7 @@ class BridgeApi(internal val token: String) {
 
 data class StreamFrame(val chat: JSONObject?, val deleted: Boolean)
 
-/** Long-lived Server-Sent Events channel for one session. Calls onFrame on a background dispatcher. */
+/** One SSE channel. Returns the Call so the caller can cancel it. */
 fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () -> Unit): Call {
     val url = "http://127.0.0.1:8765/v1/chats/$id/stream".toHttpUrl()
     val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
@@ -48,8 +51,13 @@ fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () ->
     call.enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) { onClosed() }
         override fun onResponse(call: Call, response: Response) {
-            response.use {
-                val source = it.body?.source() ?: run { onClosed(); return }
+            // Every exit path must reach onClosed, otherwise a read error leaves
+            // the caller waiting forever and the UI silently stops updating.
+            try {
+                if (!response.isSuccessful) { onClosed(); return }
+                val type = response.header("Content-Type").orEmpty()
+                if (!type.contains("text/event-stream")) { onClosed(); return }
+                val source = response.body?.source() ?: run { onClosed(); return }
                 var event = "message"
                 while (!source.exhausted()) {
                     val line = source.readUtf8LineStrict()
@@ -57,14 +65,18 @@ fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () ->
                         line.startsWith("event:") -> event = line.substringAfter(':').trim()
                         line.startsWith("data:") -> {
                             val data = line.substringAfter(':').trim()
+                            if (data.isEmpty()) continue
                             if (event == "deleted") onFrame(StreamFrame(null, true))
                             else runCatching { JSONObject(data) }.getOrNull()?.let { onFrame(StreamFrame(it, false)) }
                         }
                         line.isBlank() -> event = "message"
                     }
                 }
+            } catch (e: IOException) {
+                // Normal when the radio drops or the service is restarted.
+            } finally {
+                onClosed()
             }
-            onClosed()
         }
     })
     return call
@@ -87,6 +99,12 @@ data class FileEntry(val name: String, val path: String, val directory: Boolean,
 data class EngineSettings(val model: String = "deepseek-v4-flash", val provider: String = "deepseek-official", val apiKey: String = "", val baseUrl: String = "",
     val protocol: String = "deepseek-messages", val autoVersion: Boolean = true,
     val contextWindow: Int = 131072, val maxTokens: Int = 8192) {
+    // Kotlin default arguments do not generate Java overloads, so the Java
+    // instrumentation test could no longer construct this after contextWindow
+    // and maxTokens were added. Keep an explicit six-argument constructor.
+    constructor(model: String, provider: String, apiKey: String, baseUrl: String, protocol: String, autoVersion: Boolean) :
+        this(model, provider, apiKey, baseUrl, protocol, autoVersion, 131072, 8192)
+
     val route: String get() = if (protocol == "deepseek-messages") "deepseek-official" else "pocket-openai"
     fun json(): JSONObject = JSONObject().put("model", model).put("provider", route).put("apiKey", apiKey).put("baseUrl", baseUrl)
         .put("protocol", protocol).put("autoVersion", autoVersion)

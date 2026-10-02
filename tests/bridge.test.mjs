@@ -254,6 +254,87 @@ test('the SSE channel pushes snapshots and reports deletion', async t => {
   controller.abort();
 });
 
+test('a stale stop timer cannot kill the process from a later turn', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'first', model: 'test', apiKey: 'k', allowExecution: true } });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  const first = bridge.chats.get(chat.id).process.pid;
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'second', model: 'test', apiKey: 'k', allowExecution: true } });
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const second = bridge.chats.get(chat.id).process;
+  assert.notEqual(first, second.pid, 'a fresh engine is running');
+  // Outlive the 2.5 s escalation window the previous stop armed.
+  await new Promise(resolve => setTimeout(resolve, 2800));
+  assert.equal(second.signalCode, null, 'the old escalation timer must not touch the new process');
+  assert.notEqual(bridge.chats.get(chat.id).status, 'error');
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+});
+
+test('resume does not crash the service when it drops the old process', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'x', model: 'test', apiKey: 'k', allowExecution: true } });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+  // Resume with no follow-up prompt: the old timer used to dereference a null
+  // item.process and take the whole service down.
+  await request(`chats/${chat.id}/resume`, { method: 'POST', body: {} });
+  assert.equal(bridge.chats.get(chat.id).status, 'ready');
+  await new Promise(resolve => setTimeout(resolve, 2800));
+  assert.equal((await request('health')).status, 200, 'the service survived the stale timer');
+});
+
+test('deleting a finished session keeps it deleted', async t => {
+  const { request, projects, bridge, stateDir } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'x', model: 'test', apiKey: 'k', allowExecution: true } });
+  for (let i = 0; i < 100 && bridge.chats.get(chat.id).status !== 'ready'; i++) await new Promise(resolve => setTimeout(resolve, 50));
+  const child = bridge.chats.get(chat.id).process;
+  assert.ok(child, 'the finished session still owns its engine process');
+  await request(`chats/${chat.id}`, { method: 'DELETE' });
+  const file = path.join(stateDir, 'chats', `${chat.id}.json`);
+  assert.equal(fs.existsSync(file), false);
+  if (child && child.exitCode === null) await new Promise(resolve => child.on('exit', resolve));
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(fs.existsSync(file), false, 'a dead engine must not rewrite the transcript');
+  assert.equal(new DshSessions(stateDir, {}).sessions.has(chat.id), false, 'the record stays gone across a restart');
+});
+
+test('a plain GET returns a full snapshot even at revision zero', async t => {
+  const { request, projects } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  assert.equal(chat.revision, 0);
+  // Number(null) is 0, so an unguarded delta made this answer with a stub that
+  // had no workspaceId — the sidebar could not open a brand new session.
+  const plain = (await request(`chats/${chat.id}`)).body;
+  assert.equal(plain.unchanged, undefined);
+  assert.equal(plain.workspaceId, workspace.id);
+  assert.ok(Array.isArray(plain.messages));
+  assert.equal(plain.status, 'ready');
+  assert.equal((await request(`chats/${chat.id}?since=0`)).body.unchanged, true, 'an explicit since still works');
+});
+
+test('browsing a large directory does not stall the event loop', async t => {
+  const { request, projects } = await setup(t);
+  const wide = path.join(projects[0], 'wide');
+  fs.mkdirSync(wide);
+  for (let i = 0; i < 400; i++) fs.mkdirSync(path.join(wide, `d${i}`));
+  const started = Date.now();
+  const { body: listing } = await request('browse', { query: { path: wide, dirs: 'true' } });
+  assert.ok(Date.now() - started < 10000, 'a big folder must answer promptly');
+  assert.equal(listing.entries.length, 400);
+  assert.equal(listing.total, 400);
+  // Health has to stay answerable while a listing is in flight.
+  assert.equal((await request('health')).status, 200);
+});
+
 test('real PTY retains cd and shell variables across inputs', { skip: process.platform === 'win32' }, async t => {
   const { request, projects } = await setup(t);
   const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });

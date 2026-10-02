@@ -55,6 +55,26 @@ object TermuxConnection {
             }
     }
 
+    // Launching the bridge used to be fire-and-forget: every reconnect ran a bare
+    // `node server.mjs`, so a second launch while the first was alive died with
+    // EADDRINUSE and the app could never reconnect again. The server now adopts a
+    // healthy existing instance, and this script additionally detects a live
+    // service before starting a duplicate.
+    private fun guardScript(token: String) = """
+        export POCKET_TOKEN='$token'
+        if node -e "
+          const t = process.env.POCKET_TOKEN;
+          fetch('http://127.0.0.1:8765/v1/health', { headers: { Authorization: 'Bearer ' + t }, signal: AbortSignal.timeout(1500) })
+            .then(r => { if (r.ok) { console.log('DSH Pocket: local service already running'); process.exit(0); } process.exit(1); })
+            .catch(() => process.exit(1));
+        " 2>/dev/null; then exit 0; fi
+        if node -e "fetch('http://127.0.0.1:8765/v1/health', { signal: AbortSignal.timeout(1200) }).then(() => process.exit(3)).catch(() => process.exit(1))" 2>/dev/null; then
+          echo 'DSH Pocket: port 8765 is held by a service this app cannot authenticate with.'
+          echo 'Run in Termux: pkill -f server.mjs'
+          exit 1
+        fi
+    """.trimIndent()
+
     fun bootstrap(context: Context, token: String) {
         val script = buildString {
             append(assetsScript(context, listOf("bridge", "termux")))
@@ -62,6 +82,7 @@ object TermuxConnection {
             val base64 = Base64.encodeToString(config.toByteArray(), Base64.NO_WRAP)
             append("printf '%s' '$base64' | base64 -d > \"\$ROOT/connection.json\"\n")
             append("if ! command -v node >/dev/null || ! command -v python >/dev/null; then\n echo '请在 Termux 执行: pkg install nodejs-lts python'; exit 1; fi\n")
+            append(guardScript(token))
             append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
         }
         run(context, script, true, "DSH Pocket 本地服务")
@@ -100,6 +121,11 @@ object TermuxConnection {
         append("exec bash \"\$ROOT/termux/install-dsh.sh\"\n")
     }, false, "安装 DSH Android 引擎")
     fun installBase(context: Context) = run(context, "pkg install -y nodejs-lts python\n", false, "安装本地运行环境")
+    // Shared storage is only visible to Termux after this one-time grant; without
+    // it /sdcard and /storage/emulated/0 do not exist, which is why the workspace
+    // picker could not reach ordinary folders on the phone.
+    fun setupStorage(context: Context) = run(context,
+        "termux-setup-storage\n", false, "授权访问手机共享存储")
     fun openTerminal(context: Context, cwd: String) {
         val quote = "'" + cwd.replace("'", "'\\''") + "'"
         run(context, "cd -- $quote || exit\nexec \"\$PREFIX/bin/bash\" -l\n", false, "项目终端")

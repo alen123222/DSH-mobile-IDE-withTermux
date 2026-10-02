@@ -17,14 +17,20 @@ function stream(req, res, chats, id) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform',
     Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write(': pocket stream open\n\n');
-  const send = snapshot => {
-    if (snapshot.status === 'deleted') { res.write('event: deleted\ndata: {}\n\n'); return; }
-    res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
-  };
-  const unsubscribe = chats.subscribe(item, send);
-  const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* Closed. */ } }, 20000);
+  let unsubscribe = () => {};
+  const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch { done(); } }, 20000);
   keepAlive.unref?.();
-  const done = () => { clearInterval(keepAlive); unsubscribe(); };
+  const done = () => { clearInterval(keepAlive); unsubscribe(); unsubscribe = () => {}; };
+  const send = snapshot => {
+    if (snapshot === null) { done(); return; } // Service shutting down.
+    try {
+      if (snapshot.status === 'deleted') res.write('event: deleted\ndata: {}\n\n');
+      else res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
+    } catch { done(); }
+  };
+  // subscribe() delivers the current snapshot synchronously, so `done` and the
+  // keep-alive timer must already exist by this point.
+  unsubscribe = chats.subscribe(item, send);
   req.on('close', done); req.on('error', done); res.on('error', done);
 }
 
@@ -45,7 +51,7 @@ async function bodyOf(request) {
 
 export function createBridge({ stateDir, token, dshOptions = {} }) {
   if (typeof token !== 'string' || token.length < 32) throw new Error('Bridge token must contain at least 32 characters');
-  const workspaces = new Workspaces(stateDir), terminals = new Terminals(), chats = new DshSessions(stateDir, dshOptions);
+  const workspaces = new Workspaces(stateDir, dshOptions), terminals = new Terminals(), chats = new DshSessions(stateDir, dshOptions);
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -60,10 +66,10 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       if (parts[0] !== 'v1') throw new ApiError(404, '接口不存在');
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
-      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.0', platform: process.platform, arch: process.arch,
+      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.1', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
-      else if (method === 'GET' && parts[1] === 'browse') result = workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
+      else if (method === 'GET' && parts[1] === 'browse') result = await workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
       else if (method === 'POST' && parts[1] === 'directories') result = workspaces.create(body.parent, body.name);
       else if (method === 'GET' && parts[1] === 'workspaces') result = { items: workspaces.all() };
       else if (method === 'POST' && parts[1] === 'workspaces' && !parts[2]) result = workspaces.add(body.path);
@@ -80,7 +86,10 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       else if (method === 'GET' && parts[1] === 'chats' && !parts[2]) result = { items: chats.list(url.searchParams.get('workspaceId')) };
       else if (method === 'POST' && parts[1] === 'chats' && !parts[2]) result = chats.create(workspaces.get(body.workspaceId));
       else if (method === 'GET' && parts[1] === 'chats' && parts[3] === 'stream') return stream(req, res, chats, parts[2]);
-      else if (method === 'GET' && parts[1] === 'chats' && parts[2]) result = chats.delta(parts[2], Number(url.searchParams.get('since')));
+      else if (method === 'GET' && parts[1] === 'chats' && parts[2]) {
+        const raw = url.searchParams.get('since');
+        result = chats.delta(parts[2], raw === null ? undefined : Number(raw));
+      }
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'prompt') result = await chats.prompt(parts[2], body);
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'stop') result = chats.stop(parts[2]);
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'resume') result = chats.resume(parts[2]);
@@ -106,9 +115,40 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const configPath = path.join(stateDir, 'connection.json');
   let config = readJson(configPath, null);
   if (!config) { config = { token: crypto.randomBytes(32).toString('hex'), port: 8765 }; writeJson(configPath, config); }
+
+  // Starting a second copy used to die with a bare EADDRINUSE stack trace in
+  // Termux whenever the app was relaunched while the old service was still up.
+  // If a healthy service already owns the port and accepts our token, adopt it
+  // and exit 0; only a genuinely foreign listener is an error.
+  const probe = async () => {
+    const response = await fetch(`http://127.0.0.1:${config.port}/v1/health`,
+      { headers: { Authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(1500) });
+    return response.ok ? await response.json() : null;
+  };
+  let existing = null;
+  try { existing = await probe(); } catch { /* Nothing listening yet. */ }
+  if (existing) {
+    console.log(`DSH Pocket bridge already running on 127.0.0.1:${config.port} (pid ${existing.pid}, version ${existing.version}).`);
+    process.exit(0);
+  }
+  let portHeld = false;
+  try { await fetch(`http://127.0.0.1:${config.port}/v1/health`, { signal: AbortSignal.timeout(1200) }); portHeld = true; }
+  catch { /* Free or refused. */ }
+
   const bridge = createBridge({ stateDir, token: config.token });
-  bridge.server.on('error', error => { console.error(`DSH Pocket: ${error.message}`); process.exitCode = 1; });
-  bridge.server.listen(config.port, '127.0.0.1', () => console.log(`DSH Pocket bridge listening on 127.0.0.1:${config.port}`));
+  bridge.server.on('error', error => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(`DSH Pocket: 127.0.0.1:${config.port} 已被其他进程占用。请在 Termux 执行 pkill -f dsh-pocket，或重启 Termux 后再试。`);
+      process.exitCode = 1;
+      return;
+    }
+    console.error(`DSH Pocket: ${error.message}`);
+    process.exitCode = 1;
+  });
+  bridge.server.listen(config.port, '127.0.0.1', () => {
+    if (portHeld) console.log('DSH Pocket bridge replaced an unhealthy listener.');
+    console.log(`DSH Pocket bridge listening on 127.0.0.1:${config.port}`);
+  });
   let stopping = false;
   const stop = () => {
     if (stopping) return; stopping = true;

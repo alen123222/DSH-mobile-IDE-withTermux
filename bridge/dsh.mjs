@@ -31,17 +31,30 @@ export class DshSessions {
   create(workspace) {
     const item = { id: `pocket-${crypto.randomUUID()}`, workspaceId: workspace.id, cwd: workspace.path,
       title: '新会话', messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
-      pending: new Map(), listeners: new Set(), process: null };
+      pending: new Map(), listeners: new Set(), process: null, generation: 0, disposed: false };
     this.sessions.set(item.id, item);
     this.save(item);
     return this.snapshot(item);
+  }
+  // Everything a session's own process can still do after it was stopped,
+  // resumed or deleted has to be inert. Generation checks fence late callbacks
+  // from an old child; disposed shuts the session down for good.
+  alive(item, generation) {
+    return !item.disposed && (generation === undefined || item.generation === generation);
   }
   remove(id) {
     const item = this.sessions.get(id);
     if (!item) throw new ApiError(404, '会话不存在');
     if (item.status === 'running') throw new ApiError(409, '请先停止当前任务，再删除此对话');
-    if (item.process) killProcessTree(item.process);
-    this.flush(item);
+    // Disposed must be set before anything else: the child we are about to kill
+    // will fire an exit handler, and a pending debounced flush must not rewrite
+    // the transcript we are about to unlink.
+    item.disposed = true;
+    item.generation++;
+    this.cancelSave(item);
+    const child = item.process;
+    item.process = null;
+    if (child) killProcessTree(child);
     for (const listener of item.listeners) { try { listener(this.snapshot({ ...item, status: 'deleted' })); } catch { /* Dropped client. */ } }
     item.listeners.clear();
     this.sessions.delete(id);
@@ -64,11 +77,16 @@ export class DshSessions {
     return item;
   }
   // Incremental read: an unchanged session costs one small JSON object instead of
-  // the full message and event history on every 900 ms poll.
+  // the full message and event history on every 900 ms poll. `since` is only
+  // honoured when it was actually supplied: Number(null) is 0, and a brand new
+  // session is at revision 0, so a plain GET used to answer with a stub that had
+  // no workspaceId or messages.
   delta(id, since) {
     const item = this.get(id);
     const value = this.snapshot(item);
-    if (Number.isSafeInteger(since) && since === item.revision) return { id, revision: item.revision, unchanged: true };
+    if (since !== undefined && Number.isSafeInteger(since) && since === item.revision) {
+      return { id, revision: item.revision, unchanged: true };
+    }
     return value;
   }
   snapshot(item) {
@@ -80,10 +98,20 @@ export class DshSessions {
       .sort((a, b) => Number(Boolean(b.starred)) - Number(Boolean(a.starred)) || b.createdAt - a.createdAt)
       .map(s => ({ ...this.snapshot(s), messages: undefined, events: undefined }));
   }
-  save(item) { writeJson(path.join(this.stateDir, 'chats', `${item.id}.json`), this.snapshot(item)); }
+  save(item) {
+    if (item.disposed) return; // A deleted session must never come back on disk.
+    writeJson(path.join(this.stateDir, 'chats', `${item.id}.json`), this.snapshot(item));
+  }
+  cancelSave(item) {
+    const pending = this.saves.get(item.id);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.saves.delete(item.id);
+  }
   // Every assistant message and tool event used to rewrite the whole chat file.
   // Coalesce bursts into one trailing write so a long run stays O(1) per flush.
   touch(item) {
+    if (item.disposed) return;
     item.revision++;
     const pending = this.saves.get(item.id);
     if (pending) { pending.dirty = true; return; }
@@ -91,6 +119,7 @@ export class DshSessions {
     entry.timer = setTimeout(() => {
       entry.timer = null;
       this.saves.delete(item.id);
+      if (item.disposed) return;
       try { this.save(item); } catch { /* A failed flush must not kill the session. */ }
       if (entry.dirty) this.touch(item);
     }, this.options.saveDebounceMs ?? 400);
@@ -99,10 +128,10 @@ export class DshSessions {
     for (const send of item.listeners) { try { send(this.snapshot(item)); } catch { /* Dropped client. */ } }
   }
   flush(item) {
+    if (item.disposed) return;
     const pending = this.saves.get(item.id);
     if (!pending) return;
-    if (pending.timer) clearTimeout(pending.timer);
-    this.saves.delete(item.id);
+    this.cancelSave(item);
     try { this.save(item); } catch { /* Ignore: the next touch retries. */ }
   }
   subscribe(item, send) {
@@ -123,13 +152,15 @@ export class DshSessions {
   }
   request(item, method, params) {
     const id = ++item.requestId;
+    const child = item.process;
+    if (!child) return Promise.reject(new Error('DSH 进程不可用'));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         item.pending.delete(id);
         reject(new Error(`DSH ${method} 超时。${item.stderr || ''}`));
       }, this.options.timeoutMs ?? 60000);
       item.pending.set(id, { resolve, reject, timer });
-      item.process.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   }
   async start(item, settings) {
@@ -150,11 +181,18 @@ export class DshSessions {
     const [command, ...args] = this.options.command || [binary, '--profile', 'sdk-minimal'];
     args.push('--patch', writeProviderPatch(this.stateDir, item.id, settings));
     item.connectionSignature = connectionSignature(settings);
-    item.process = spawn(command, args, { cwd: item.cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
-    item.process.stdin.on('error', error => this.fail(item, error));
-    item.process.stderr.on('data', chunk => { item.stderr = this.redact(item, item.stderr + chunk.toString()); });
-    item.process.on('error', error => this.fail(item, error));
-    item.process.on('exit', (code, signal) => {
+    const child = spawn(command, args, { cwd: item.cwd, env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+    // Every handler below is fenced by this generation. A child that is replaced
+    // by a later start (or nulled by resume/stop) must not touch session state.
+    const generation = ++item.generation;
+    const live = () => this.alive(item, generation);
+    item.process = child;
+    child.stdin.on('error', error => { if (live()) this.fail(item, error); });
+    child.stderr.on('data', chunk => { if (live()) item.stderr = this.redact(item, item.stderr + chunk.toString()); });
+    child.on('error', error => { if (live()) this.fail(item, error); });
+    child.on('exit', (code, signal) => {
+      if (!live()) return; // Superseded or deleted: this exit is not news.
+      if (item.process === child) item.process = null;
       for (const request of item.pending.values()) {
         clearTimeout(request.timer);
         request.reject(new Error(`DSH 已退出 (${signal || code})。${item.stderr}`));
@@ -164,14 +202,16 @@ export class DshSessions {
       item.apiKey = '';
     });
     let bytes = 0;
-    const lines = createInterface({ input: item.process.stdout, crlfDelay: Infinity });
-    item.process.stdout.on('data', chunk => {
+    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    child.stdout.on('data', chunk => {
       // readline otherwise retains unbounded input if a broken runtime omits newlines.
+      if (!live()) return;
       bytes += chunk.length;
-      if (bytes > 8 * 1024 * 1024) { this.fail(item, new Error('DSH 协议帧超出限制')); killProcessTree(item.process); }
+      if (bytes > 8 * 1024 * 1024) { this.fail(item, new Error('DSH 协议帧超出限制')); killProcessTree(child); }
       if (chunk.includes(10)) bytes = 0;
     });
     lines.on('line', line => {
+      if (!live()) return;
       try {
         const frame = JSON.parse(line);
         if (frame.jsonrpc !== '2.0') throw new Error('DSH 返回了未知协议');
@@ -182,7 +222,7 @@ export class DshSessions {
           if (frame.error) pending.reject(new Error(frame.error.message || JSON.stringify(frame.error)));
           else pending.resolve(frame.result);
         } else this.notification(item, frame);
-      } catch (error) { this.fail(item, new Error(`DSH 协议解析失败：${error.message}`)); killProcessTree(item.process); }
+      } catch (error) { this.fail(item, new Error(`DSH 协议解析失败：${error.message}`)); killProcessTree(child); }
     });
     const response = await this.request(item, 'initialize', { cwd: item.cwd,
       provider: settings.provider, model: text(settings.model, '模型名称', 200), maxTokens: settings.maxTokens ?? 8192 });
@@ -266,12 +306,26 @@ export class DshSessions {
   stop(id) {
     const item = this.get(id);
     item.status = 'stopped'; this.touch(item);
-    if (item.process && item.process.exitCode === null) {
-      killProcessTree(item.process);
-      const timer = setTimeout(() => { if (item.process.exitCode === null) killProcessTree(item.process, 'SIGKILL'); }, 2500);
-      timer.unref();
-    }
+    this.terminate(item);
+    this.flush(item);
     return this.snapshot(item);
+  }
+  // Escalate to SIGKILL for one specific child, captured by value. The old code
+  // re-read the mutable item.process inside the timer, so a resume() that
+  // replaced the child with a fresh PID got that new process killed instead —
+  // and a resume() that nulled it crashed the whole service on a null deref.
+  terminate(item) {
+    const child = item.process;
+    if (!child || child.exitCode !== null) { item.process = null; return; }
+    item.generation++; // Retire this child before its exit handler can report.
+    item.process = null;
+    killProcessTree(child);
+    const escalation = setTimeout(() => {
+      try { if (child.exitCode === null) killProcessTree(child, 'SIGKILL'); }
+      catch { /* Already reaped. */ }
+    }, 2500);
+    escalation.unref();
+    try { child.once('exit', () => clearTimeout(escalation)); } catch { /* Not an EventEmitter. */ }
   }
   // A stopped session used to be permanently unusable: prompt() demanded 'ready'
   // and start() refused an existing process. Drop the dead process so the next
@@ -279,10 +333,7 @@ export class DshSessions {
   resume(id) {
     const item = this.get(id);
     if (item.status === 'running') throw new ApiError(409, '任务仍在运行');
-    if (item.process) {
-      if (item.process.exitCode === null) killProcessTree(item.process);
-      item.process = null;
-    }
+    this.terminate(item);
     item.status = 'ready';
     item.error = undefined;
     item.receipt = null;
@@ -293,7 +344,12 @@ export class DshSessions {
     return this.snapshot(item);
   }
   closeAll() {
-    for (const item of this.sessions.values()) { if (item.process) this.stop(item.id); this.flush(item); item.listeners.clear(); }
+    for (const item of this.sessions.values()) {
+      if (item.process) this.terminate(item);
+      this.flush(item);
+      for (const listener of [...item.listeners]) { try { listener(null); } catch { /* Dropped client. */ } }
+      item.listeners.clear();
+    }
     for (const entry of this.saves.values()) if (entry.timer) clearTimeout(entry.timer);
     this.saves.clear();
   }

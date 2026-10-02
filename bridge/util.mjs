@@ -14,9 +14,26 @@ export function text(value, name, max = 8192) {
 export function directory(value) {
   text(value, '目录');
   if (!path.isAbsolute(value)) throw new ApiError(400, '请选择绝对路径');
-  const result = fs.realpathSync(value);
-  if (!fs.statSync(result).isDirectory()) throw new ApiError(400, '该路径不是文件夹');
-  fs.accessSync(result, fs.constants.R_OK | fs.constants.X_OK);
+  let result;
+  try { result = fs.realpathSync(value); }
+  catch (error) {
+    if (error.code === 'ENOENT') throw new ApiError(404, '目录不存在');
+    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有访问该目录的权限');
+    throw error;
+  }
+  let stat;
+  try { stat = fs.statSync(result); }
+  catch (error) {
+    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有访问该目录的权限');
+    throw error;
+  }
+  if (!stat.isDirectory()) throw new ApiError(400, '该路径不是文件夹');
+  // R_OK|X_OK is the wrong test for shared storage: Android's FUSE mount often
+  // reports a bare directory as non-readable until it has been opened, and
+  // refusing here made /sdcard and /storage/emulated/0 unreachable. Listing is
+  // allowed to try and surface a real error instead.
+  try { fs.accessSync(result, fs.constants.R_OK | fs.constants.X_OK); }
+  catch { /* Let the actual read decide. */ }
   return result;
 }
 export function writeJson(filename, value) {

@@ -5,8 +5,9 @@ import crypto from 'node:crypto';
 import { ApiError, directory, readJson, writeJson, text, within } from './util.mjs';
 
 export class Workspaces {
-  constructor(stateDir) {
+  constructor(stateDir, options = {}) {
     this.filename = path.join(stateDir, 'workspaces.json');
+    this.options = options;
     this.items = readJson(this.filename, []);
   }
   all() {
@@ -41,17 +42,29 @@ export class Workspaces {
     writeJson(this.filename, this.items);
     return { ...item, available: fs.existsSync(item.path) };
   }
-  browse(location = os.homedir(), dirsOnly = false) {
+  async browse(location = os.homedir(), dirsOnly = false) {
     const canonical = directory(location);
-    const entries = fs.readdirSync(canonical, { withFileTypes: true }).flatMap(entry => {
-      const filename = path.join(canonical, entry.name);
-      try {
-        const stat = fs.statSync(filename);
-        if (dirsOnly && !stat.isDirectory()) return [];
-        return [{ name: entry.name, path: filename, directory: stat.isDirectory(), size: stat.size, symlink: entry.isSymbolicLink() }];
-      } catch { return []; /* Broken or inaccessible entries cannot be opened. */ }
-    }).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
-    return { path: canonical, parent: path.dirname(canonical), home: os.homedir(), entries: entries.slice(0, 2000), truncated: entries.length > 2000 };
+    let names;
+    try { names = await fs.promises.readdir(canonical); }
+    catch (error) {
+      if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有读取该目录的权限');
+      if (error.code === 'ELOOP') throw new ApiError(400, '目录链接形成循环');
+      throw error;
+    }
+    // Shared storage over Android's FUSE mount costs tens of milliseconds per
+    // entry. The old synchronous statSync loop blocked the whole event loop for
+    // seconds on a large folder, which starved /health and timed out the UI.
+    const settled = await Promise.all(names.map(name => fs.promises
+      .stat(path.join(canonical, name))
+      .then(stat => ({ name, stat }), () => null)));
+    const entries = settled.filter(Boolean)
+      .filter(({ stat }) => !(dirsOnly && !stat.isDirectory()))
+      .map(({ name, stat }) => ({ name, path: path.join(canonical, name),
+        directory: stat.isDirectory(), size: stat.size, symlink: false }))
+      .sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
+    const limit = this.options.browseLimit ?? 2000;
+    return { path: canonical, parent: path.dirname(canonical), home: os.homedir(),
+      entries: entries.slice(0, limit), truncated: entries.length > limit, total: entries.length };
   }
   create(parent, name) {
     text(name, '目录名', 255);

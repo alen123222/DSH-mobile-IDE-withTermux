@@ -126,7 +126,7 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
             Box(Modifier.weight(1f).fillMaxHeight()) { content() }
         } else ModalNavigationDrawer(drawerState = drawer, drawerContent = { ModalDrawerSheet { Box(Modifier.width(288.dp)) { panel() } } }) { content() }
     }
-    if (workspacePicker) WorkspaceDialog(state, model) { workspacePicker = false }
+    if (workspacePicker) WorkspaceDialog(state, model, { workspacePicker = false }, { workspacePicker = false; safe { TermuxConnection.setupStorage(context) } })
     state.preview?.let { preview ->
         AlertDialog(onDismissRequest = model::closePreview, title = { Text(preview.string("path").substringAfterLast('/')) },
             text = { SelectionContainer { Text(preview.string("content"), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall,
@@ -269,22 +269,26 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
         if (events.isNotEmpty()) TextButton(onClick = { showEvents = true }, modifier = Modifier.padding(start = 16.dp)) {
             Icon(Icons.Outlined.DataObject, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("查看工具活动 · ${events.size}")
         }
-        if (status in listOf("stopped", "error")) {
-            Surface(color = Color(0xFFF0F3F9), modifier = Modifier.fillMaxWidth()) {
-                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (status == "stopped") "任务已停止，记录已保存。可以继续在这个对话里提问。" else "本次运行出错，记录已保存。",
-                        modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                    TextButton(onClick = { model.newChat() }) { Text("新建会话") }
-                }
-            }
-        } else if (status == "archived") {
+        // The composer used to live in the final else branch, so a stopped
+        // session showed "keep typing" with no way to actually type.
+        val composable = status != "archived"
+        if (!composable) {
             Surface(color = Color(0xFFF0F3F9), modifier = Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("这是上次运行留下的记录，只读。", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                     TextButton(onClick = { model.newChat() }) { Text("新建会话") }
                 }
             }
-        } else Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp).widthIn(max = 1000.dp).fillMaxWidth()) {
+        }
+        if (composable) Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp).widthIn(max = 1000.dp).fillMaxWidth()) {
+            if (status in listOf("stopped", "error")) Surface(color = Color(0xFFFFF7E6), shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (status == "stopped") "任务已停止，记录已保存。继续提问会在同一目录重新启动 DSH。" else "上次运行出错。继续提问会重启 DSH。",
+                        modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = Color(0xFF8A6D3B))
+                    TextButton(onClick = { model.newChat() }) { Text("新建会话") }
+                }
+            }
             if (!state.consent) Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = state.consent, onCheckedChange = model::consent)
                 Text("允许此会话在 Termux 权限范围内修改文件、执行命令", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B), modifier = Modifier.clickable { model.consent(!state.consent) })
@@ -339,7 +343,7 @@ private fun FileRow(entry: FileEntry, onClick: () -> Unit) {
 }
 
 @Composable
-private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () -> Unit) {
+private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () -> Unit, grantStorage: () -> Unit) {
     var path by remember(state.browserPath) { mutableStateOf(state.browserPath) }
     var create by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
@@ -350,14 +354,22 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
             Row {
                 TextButton(onClick = { model.browse(state.health?.string("home").orEmpty(), true) }) { Text("主目录") }
                 TextButton(onClick = { model.browse("/sdcard", true) }) { Text("共享存储") }
+                TextButton(onClick = { model.browse("/storage/emulated/0", true) }) { Text("内部存储") }
                 TextButton(onClick = { model.browse(state.browserParent, true) }) { Text("上一级") }
             }
-            LazyColumn(Modifier.height(300.dp)) {
+            // /sdcard only exists inside Termux after termux-setup-storage; without
+            // that grant the picker could not see any ordinary phone folder.
+            TextButton(onClick = grantStorage) {
+                Icon(Icons.Outlined.SdCard, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
+                Text("手机里看不到其他文件夹？授权共享存储")
+            }
+            if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
+            LazyColumn(Modifier.height(260.dp)) {
                 items(state.entries.filter { it.directory }, key = { it.path }) { entry -> FileRow(entry) { model.browse(entry.path, true) } }
             }
             TextButton(onClick = { create = true }) { Icon(Icons.Outlined.CreateNewFolder, null); Spacer(Modifier.width(8.dp)); Text("在此新建文件夹") }
         }
-    }, confirmButton = { Button(onClick = { model.addWorkspace(state.browserPath); dismiss() }, enabled = state.browserPath.isNotBlank() && !state.browserLoading) { Text("使用此目录") } },
+    }, confirmButton = { Button(onClick = { model.addWorkspace(path.trim().ifBlank { state.browserPath }); dismiss() }, enabled = path.isNotBlank() || state.browserPath.isNotBlank()) { Text("使用此目录") } },
         dismissButton = { TextButton(onClick = dismiss) { Text("取消") } })
     if (create) AlertDialog(onDismissRequest = { create = false }, title = { Text("新建文件夹") }, text = { OutlinedTextField(name, { name = it }, singleLine = true, label = { Text("文件夹名称") }) },
         confirmButton = { TextButton(onClick = { model.createDirectory(name); create = false }) { Text("创建") } })

@@ -40,6 +40,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     private var monitor: Job? = null
     private var streamCall: Call? = null
     private var streaming: String? = null
+    private val streamEnded = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var connecting: Job? = null
     private var selectionRevision = 0
     private var browserRevision = 0
@@ -192,30 +193,48 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(chat = value, consent = false) }
         monitor(id)
     }
-    // Live updates: prefer the SSE push channel; fall back to revision-based
-    // polling (cheap, because an unchanged session returns a tiny object) when
-    // the stream cannot be established.
+    // Live updates: prefer the SSE push channel, and keep polling as a floor.
+    // The first version stopped supervising as soon as the first frame arrived,
+    // so a stream that dropped later (screen lock, Termux restart) never
+    // reconnected and never fell back — the chat silently froze.
     private fun monitor(id: String) {
         monitor?.cancel()
         streamCall?.cancel()
         streaming = id
         monitor = viewModelScope.launch {
-            val opened = withContext(Dispatchers.IO) { openStream(id) }
-            if (!opened) {
-                while (streaming == id) {
-                    delay(900)
-                    try {
-                        val since = mutable.value.chat?.optInt("revision", -1) ?: -1
-                        val chat = withContext(Dispatchers.IO) { api.call("chats/$id", query = mapOf("since" to since.toString())) }
-                        if (streaming != id || state.value.chat?.string("id") != id) return@launch
-                        if (!chat.optBoolean("unchanged", false)) mutable.update { it.copy(chat = chat, connected = true) }
-                    } catch (e: Exception) {
-                        mutable.update { it.copy(connected = false) }
-                        delay(2000)
-                    }
+            while (streaming == id) {
+                val since = mutable.value.chat?.optInt("revision", -1) ?: -1
+                val delivered = if (openStream(id)) awaitStreamEnd(id) else false
+                if (streaming != id) return@launch
+                if (delivered) {
+                    // Stream worked at least once. Reconnect promptly, but do not
+                    // spin: give the service a moment to come back.
+                    delay(1200)
+                } else {
+                    // Never got a usable stream: poll, and retry the stream later.
+                    delay(2500)
+                }
+                if (streaming != id) return@launch
+                if (delivered) continue
+                try {
+                    val chat = withContext(Dispatchers.IO) { api.call("chats/$id", query = mapOf("since" to since.toString())) }
+                    if (streaming != id || state.value.chat?.string("id") != id) return@launch
+                    if (!chat.optBoolean("unchanged", false)) mutable.update { it.copy(chat = chat, connected = true) }
+                } catch (e: Exception) {
+                    mutable.update { it.copy(connected = false) }
+                    delay(2000)
                 }
             }
         }
+    }
+    // Returns true once the session was deleted; false when the channel closed
+    // for any other reason and should be re-established.
+    private suspend fun awaitStreamEnd(id: String): Boolean = suspendCancellableCoroutine { cont ->
+        val job = viewModelScope.launch {
+            while (streaming == id && !streamEnded.contains(id)) delay(150)
+            if (cont.isActive) cont.resume(streamEnded.remove(id)) {}
+        }
+        cont.invokeOnCancellation { job.cancel() }
     }
     // Resolves true once the first frame arrives (the bridge sends the current
     // snapshot immediately on subscribe), false if the stream dies before that.
@@ -231,6 +250,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                         mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id },
                             chat = if (it.chat?.string("id") == id) null else it.chat) }
                         streaming = null
+                        streamEnded.add(id)
                     }
                     frame.chat != null -> {
                         val chat = frame.chat
@@ -245,6 +265,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             onClosed = {
                 if (streaming != id) return@stream
                 mutable.update { it.copy(connected = false) }
+                streamEnded.add(id)
                 if (!settled) { settled = true; if (cont.isActive) cont.resume(false) {} }
             })
         streamCall = call
@@ -303,8 +324,15 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             chat = if (wasSelected) null else it.chat, chats = if (wasSelected) emptyList() else it.chats,
             entries = if (wasSelected) emptyList() else it.entries, browserPath = if (wasSelected) "" else it.browserPath,
             terminalId = if (wasSelected) null else it.terminalId) }
-        if (wasSelected) { streaming = null; streamCall?.cancel() }
-        mutable.value.workspaces.firstOrNull()?.let { if (!wasSelected) select(it) }
+        if (wasSelected) {
+            streaming = null
+            streamCall?.cancel()
+            // Only when the removed project was the active one do we move on to
+            // a replacement. Removing some other workspace must leave the
+            // current project, chat and terminal exactly as they were.
+            val next = mutable.value.workspaces.firstOrNull()
+            if (next != null) select(next)
+        }
     }
     fun terminal() = task {
         val workspace = state.value.selected ?: return@task
