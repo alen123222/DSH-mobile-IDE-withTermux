@@ -14,11 +14,14 @@ export class DshSessions {
     this.stateDir = stateDir;
     this.options = options;
     this.sessions = new Map();
+    this.saves = new Map();
     const dir = path.join(stateDir, 'chats');
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     for (const name of fs.readdirSync(dir).filter(n => n.endsWith('.json'))) {
       const data = readJson(path.join(dir, name));
-      this.sessions.set(data.id, { ...data, status: 'archived', process: null, pending: new Map() });
+      if (!data?.id) continue;
+      this.sessions.set(data.id, { ...data, status: 'archived', starred: data.starred === true,
+        process: null, pending: new Map(), listeners: new Set() });
     }
   }
   dshBin() {
@@ -27,9 +30,32 @@ export class DshSessions {
   }
   create(workspace) {
     const item = { id: `pocket-${crypto.randomUUID()}`, workspaceId: workspace.id, cwd: workspace.path,
-      title: '新会话', messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), pending: new Map(), process: null };
+      title: '新会话', messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
+      pending: new Map(), listeners: new Set(), process: null };
     this.sessions.set(item.id, item);
     this.save(item);
+    return this.snapshot(item);
+  }
+  remove(id) {
+    const item = this.sessions.get(id);
+    if (!item) throw new ApiError(404, '会话不存在');
+    if (item.status === 'running') throw new ApiError(409, '请先停止当前任务，再删除此对话');
+    if (item.process) killProcessTree(item.process);
+    this.flush(item);
+    for (const listener of item.listeners) { try { listener(this.snapshot({ ...item, status: 'deleted' })); } catch { /* Dropped client. */ } }
+    item.listeners.clear();
+    this.sessions.delete(id);
+    try { fs.rmSync(path.join(this.stateDir, 'chats', `${id}.json`), { force: true }); }
+    catch { /* Private data may already be gone. */ }
+    try { fs.rmSync(path.join(this.stateDir, 'provider-patches', `${id}.json`), { force: true }); }
+    catch { /* No provider patch was written. */ }
+    return { ok: true, id };
+  }
+  star(id, value) {
+    const item = this.get(id);
+    item.starred = value === true;
+    this.touch(item);
+    this.flush(item);
     return this.snapshot(item);
   }
   get(id) {
@@ -37,16 +63,53 @@ export class DshSessions {
     if (!item) throw new ApiError(404, '会话不存在');
     return item;
   }
+  // Incremental read: an unchanged session costs one small JSON object instead of
+  // the full message and event history on every 900 ms poll.
+  delta(id, since) {
+    const item = this.get(id);
+    const value = this.snapshot(item);
+    if (Number.isSafeInteger(since) && since === item.revision) return { id, revision: item.revision, unchanged: true };
+    return value;
+  }
   snapshot(item) {
-    const { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error } = item;
-    return { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error };
+    const { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error, starred } = item;
+    return { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error, starred: starred === true };
   }
   list(workspaceId) {
     return [...this.sessions.values()].filter(s => s.workspaceId === workspaceId)
-      .sort((a, b) => b.createdAt - a.createdAt).map(s => ({ ...this.snapshot(s), messages: undefined, events: undefined }));
+      .sort((a, b) => Number(Boolean(b.starred)) - Number(Boolean(a.starred)) || b.createdAt - a.createdAt)
+      .map(s => ({ ...this.snapshot(s), messages: undefined, events: undefined }));
   }
   save(item) { writeJson(path.join(this.stateDir, 'chats', `${item.id}.json`), this.snapshot(item)); }
-  touch(item) { item.revision++; this.save(item); }
+  // Every assistant message and tool event used to rewrite the whole chat file.
+  // Coalesce bursts into one trailing write so a long run stays O(1) per flush.
+  touch(item) {
+    item.revision++;
+    const pending = this.saves.get(item.id);
+    if (pending) { pending.dirty = true; return; }
+    const entry = { dirty: false, timer: null };
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      this.saves.delete(item.id);
+      try { this.save(item); } catch { /* A failed flush must not kill the session. */ }
+      if (entry.dirty) this.touch(item);
+    }, this.options.saveDebounceMs ?? 400);
+    entry.timer.unref?.();
+    this.saves.set(item.id, entry);
+    for (const send of item.listeners) { try { send(this.snapshot(item)); } catch { /* Dropped client. */ } }
+  }
+  flush(item) {
+    const pending = this.saves.get(item.id);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.saves.delete(item.id);
+    try { this.save(item); } catch { /* Ignore: the next touch retries. */ }
+  }
+  subscribe(item, send) {
+    item.listeners.add(send);
+    send(this.snapshot(item));
+    return () => item.listeners.delete(send);
+  }
   fail(item, error) {
     if (item.status === 'stopped' || item.status === 'archived') return;
     item.status = 'error';
@@ -122,7 +185,7 @@ export class DshSessions {
       } catch (error) { this.fail(item, new Error(`DSH 协议解析失败：${error.message}`)); killProcessTree(item.process); }
     });
     const response = await this.request(item, 'initialize', { cwd: item.cwd,
-      provider: settings.provider, model: text(settings.model, '模型名称', 200), maxTokens: 4096 });
+      provider: settings.provider, model: text(settings.model, '模型名称', 200), maxTokens: settings.maxTokens ?? 8192 });
     if (response?.serverInfo?.name !== 'deepseek-harness-sdk-runtime') throw new Error('DSH SDK 版本不兼容');
   }
   notification(item, frame) {
@@ -143,11 +206,17 @@ export class DshSessions {
         const content = event.data?.message?.content;
         if (!Array.isArray(content)) throw new Error('无效的助手消息');
         const value = content.filter(c => c.type === 'text').map(c => c.text).join('');
-        if (value) item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now() });
+        if (value) {
+          item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now() });
+          // messages had no ceiling at all; a long run grew the snapshot (and every
+          // flush) without bound. Keep the tail, which is what the user reads.
+          const limit = this.options.maxMessages ?? 500;
+          if (item.messages.length > limit) item.messages.splice(0, item.messages.length - limit);
+        }
       }
       if (['tool/call', 'tool/result', 'turn/end', 'assistant/attempt'].includes(event.type)) {
         item.events.push({ type: event.type, data: event.data, time: Date.now() });
-        if (item.events.length > 300) item.events.shift();
+        if (item.events.length > (this.options.maxEvents ?? 300)) item.events.shift();
         if (event.type === 'turn/end' && event.data?.reason?.kind === 'error') item.error = this.redact(item, JSON.stringify(event.data.reason));
       }
       if (event.type === 'assistant/message' || event.type.startsWith('tool/') || event.type === 'turn/end') this.touch(item);
@@ -160,7 +229,9 @@ export class DshSessions {
   async prompt(id, body) {
     const item = this.get(id);
     if (body.allowExecution !== true) throw new ApiError(403, '请先允许此会话执行命令和修改文件');
-    if (item.status !== 'ready') throw new ApiError(409, item.status === 'running' ? '任务仍在运行' : '此会话已结束，请新建会话；原有记录保留');
+    if (item.status === 'stopped') this.resume(item.id);
+    if (item.status === 'archived') throw new ApiError(409, '此会话来自上次运行，请在侧栏新建对话继续');
+    if (item.status !== 'ready') throw new ApiError(409, item.status === 'running' ? '任务仍在运行' : '此会话当前不可用');
     text(body.prompt, '消息', 100000);
     text(body.model, '模型名称', 200);
     const settings = connectionSettings(body);
@@ -175,6 +246,7 @@ export class DshSessions {
     item.messages.push({ id: crypto.randomUUID(), role: 'user', text: body.prompt, time: Date.now() });
     if (item.title === '新会话') item.title = body.prompt.slice(0, 40);
     this.touch(item);
+    this.flush(item);
     // Return a durable enqueue acknowledgement immediately; UI observes the snapshot revision.
     void (async () => {
       try {
@@ -201,5 +273,28 @@ export class DshSessions {
     }
     return this.snapshot(item);
   }
-  closeAll() { for (const item of this.sessions.values()) if (item.process) this.stop(item.id); }
+  // A stopped session used to be permanently unusable: prompt() demanded 'ready'
+  // and start() refused an existing process. Drop the dead process so the next
+  // prompt transparently spawns a fresh engine with the same history and cwd.
+  resume(id) {
+    const item = this.get(id);
+    if (item.status === 'running') throw new ApiError(409, '任务仍在运行');
+    if (item.process) {
+      if (item.process.exitCode === null) killProcessTree(item.process);
+      item.process = null;
+    }
+    item.status = 'ready';
+    item.error = undefined;
+    item.receipt = null;
+    item.consumed = false;
+    item.notificationBuffer = [];
+    this.touch(item);
+    this.flush(item);
+    return this.snapshot(item);
+  }
+  closeAll() {
+    for (const item of this.sessions.values()) { if (item.process) this.stop(item.id); this.flush(item); item.listeners.clear(); }
+    for (const entry of this.saves.values()) if (entry.timer) clearTimeout(entry.timer);
+    this.saves.clear();
+  }
 }

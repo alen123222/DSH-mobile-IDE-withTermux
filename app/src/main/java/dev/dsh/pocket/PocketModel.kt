@@ -11,7 +11,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import okhttp3.Call
 import org.json.JSONObject
 import java.util.UUID
 
@@ -35,6 +38,8 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         activePresetId = savedPresets.first, presets = savedPresets.second))
     val state = mutable.asStateFlow()
     private var monitor: Job? = null
+    private var streamCall: Call? = null
+    private var streaming: String? = null
     private var connecting: Job? = null
     private var selectionRevision = 0
     private var browserRevision = 0
@@ -108,13 +113,13 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                         if (health != null) break
                     }
                 }
-                if (health != null && health.string("version") != "0.2.0" && start) {
+                if (health != null && health.string("version") != BRIDGE_VERSION && start) {
                     TermuxConnection.upgrade(getApplication(), token)
                     health = null
                     for (attempt in 0 until 40) {
                         delay(500)
                         val next = runCatching { withContext(Dispatchers.IO) { api.call("health") } }.getOrNull()
-                        if (next?.string("version") == "0.2.0") { health = next; break }
+                        if (next?.string("version") == BRIDGE_VERSION) { health = next; break }
                     }
                 }
                 if (health != null) {
@@ -187,21 +192,63 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(chat = value, consent = false) }
         monitor(id)
     }
+    // Live updates: prefer the SSE push channel; fall back to revision-based
+    // polling (cheap, because an unchanged session returns a tiny object) when
+    // the stream cannot be established.
     private fun monitor(id: String) {
         monitor?.cancel()
+        streamCall?.cancel()
+        streaming = id
         monitor = viewModelScope.launch {
-            while (true) {
-                delay(900)
-                try {
-                    val chat = withContext(Dispatchers.IO) { api.call("chats/$id") }
-                    if (state.value.chat?.string("id") != id) return@launch
-                    mutable.update { it.copy(chat = chat, connected = true) }
-                } catch (e: Exception) {
-                    mutable.update { it.copy(connected = false) }
-                    delay(2000)
+            val opened = withContext(Dispatchers.IO) { openStream(id) }
+            if (!opened) {
+                while (streaming == id) {
+                    delay(900)
+                    try {
+                        val since = mutable.value.chat?.optInt("revision", -1) ?: -1
+                        val chat = withContext(Dispatchers.IO) { api.call("chats/$id", query = mapOf("since" to since.toString())) }
+                        if (streaming != id || state.value.chat?.string("id") != id) return@launch
+                        if (!chat.optBoolean("unchanged", false)) mutable.update { it.copy(chat = chat, connected = true) }
+                    } catch (e: Exception) {
+                        mutable.update { it.copy(connected = false) }
+                        delay(2000)
+                    }
                 }
             }
         }
+    }
+    // Resolves true once the first frame arrives (the bridge sends the current
+    // snapshot immediately on subscribe), false if the stream dies before that.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun openStream(id: String): Boolean = suspendCancellableCoroutine { cont ->
+        var settled = false
+        val call = api.stream(id,
+            onFrame = { frame ->
+                if (streaming != id) return@stream
+                if (!settled) { settled = true; if (cont.isActive) cont.resume(true) {} }
+                when {
+                    frame.deleted -> {
+                        mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id },
+                            chat = if (it.chat?.string("id") == id) null else it.chat) }
+                        streaming = null
+                    }
+                    frame.chat != null -> {
+                        val chat = frame.chat
+                        mutable.update { state ->
+                            val index = state.chats.indexOfFirst { it.string("id") == id }
+                            val chats = if (index >= 0) state.chats.toMutableList().also { it[index] = chat } else state.chats
+                            state.copy(chat = if (state.chat?.string("id") == id) chat else state.chat, chats = chats, connected = true)
+                        }
+                    }
+                }
+            },
+            onClosed = {
+                if (streaming != id) return@stream
+                mutable.update { it.copy(connected = false) }
+                if (!settled) { settled = true; if (cont.isActive) cont.resume(false) {} }
+            })
+        streamCall = call
+        cont.invokeOnCancellation { call.cancel() }
     }
     fun send(prompt: String) = task {
         val state = state.value
@@ -211,6 +258,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             api.call("chats/${chat.getString("id")}/prompt", "POST", JSONObject().put("prompt", prompt)
                 .put("model", settings.model).put("provider", settings.route).put("apiKey", settings.apiKey)
                 .put("protocol", settings.protocol).put("autoVersion", settings.autoVersion)
+                .put("contextWindow", settings.contextWindow).put("maxTokens", settings.maxTokens)
                 .put("baseUrl", settings.baseUrl).put("allowExecution", state.consent))
         }
         if (mutable.value.chat?.string("id") == value.string("id")) mutable.update { it.copy(chat = value) }
@@ -219,6 +267,44 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         val id = state.value.chat?.string("id") ?: return@task
         val value = withContext(Dispatchers.IO) { api.call("chats/$id/stop", "POST") }
         if (mutable.value.chat?.string("id") == id) mutable.update { it.copy(chat = value) }
+    }
+    fun starChat(chat: JSONObject) = task {
+        val id = chat.getString("id")
+        val next = !chat.optBoolean("starred", false)
+        val value = withContext(Dispatchers.IO) { api.call("chats/$id/star", "POST", JSONObject().put("starred", next)) }
+        mutable.update { state ->
+            val items = state.chats.map { if (it.string("id") == id) value else it }
+                .sortedByDescending { it.optBoolean("starred", false) }
+            state.copy(chats = items, chat = if (state.chat?.string("id") == id) value else state.chat)
+        }
+    }
+    fun deleteChat(chat: JSONObject) = task {
+        val id = chat.getString("id")
+        withContext(Dispatchers.IO) { api.call("chats/$id", "DELETE") }
+        val wasOpen = state.value.chat?.string("id") == id
+        mutable.update { state -> state.copy(
+            chats = state.chats.filterNot { it.string("id") == id },
+            chat = if (wasOpen) null else state.chat, consent = if (wasOpen) false else state.consent) }
+        if (wasOpen) streaming = null
+    }
+    fun starWorkspace(workspace: Workspace) = task {
+        val value = withContext(Dispatchers.IO) {
+            Workspace.from(api.call("workspaces/${workspace.id}/star", "POST", JSONObject().put("starred", !workspace.starred)))
+        }
+        val all = mutable.value.workspaces.map { if (it.id == value.id) value else it }
+            .sortedByDescending { it.starred }
+        mutable.update { it.copy(workspaces = all) }
+    }
+    fun deleteWorkspace(workspace: Workspace) = task {
+        withContext(Dispatchers.IO) { api.call("workspaces/${workspace.id}", "DELETE") }
+        val all = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+        val wasSelected = state.value.selected?.id == workspace.id
+        mutable.update { it.copy(workspaces = all, selected = if (wasSelected) null else it.selected,
+            chat = if (wasSelected) null else it.chat, chats = if (wasSelected) emptyList() else it.chats,
+            entries = if (wasSelected) emptyList() else it.entries, browserPath = if (wasSelected) "" else it.browserPath,
+            terminalId = if (wasSelected) null else it.terminalId) }
+        if (wasSelected) { streaming = null; streamCall?.cancel() }
+        mutable.value.workspaces.firstOrNull()?.let { if (!wasSelected) select(it) }
     }
     fun terminal() = task {
         val workspace = state.value.selected ?: return@task

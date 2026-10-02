@@ -51,6 +51,18 @@ fun ApiPresetsPane(state: PocketState, model: PocketModel) {
         OutlinedTextField(draft.apiKey, { edit(draft.copy(apiKey = it)) }, label = { Text("API Key") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(draft.model, { edit(draft.copy(model = it)) }, label = { Text("模型 ID（可手动填写）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(draft.contextWindow.toString(), {
+                val value = it.filter(Char::isDigit).take(7).toIntOrNull()
+                if (value != null) edit(draft.copy(contextWindow = value.coerceIn(4096, 4194304)))
+            }, label = { Text("上下文长度") }, singleLine = true, modifier = Modifier.weight(1f),
+            supportingText = { Text("默认 131072") })
+            OutlinedTextField(draft.maxTokens.toString(), {
+                val value = it.filter(Char::isDigit).take(6).toIntOrNull()
+                if (value != null) edit(draft.copy(maxTokens = value.coerceIn(256, 131072)))
+            }, label = { Text("单次输出上限") }, singleLine = true, modifier = Modifier.weight(1f),
+            supportingText = { Text("默认 8192") })
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(enabled = !state.apiChecking && draft.apiKey.isNotBlank(), onClick = { model.checkApi(draft, true) }) { Text("查询模型") }
             OutlinedButton(enabled = !state.apiChecking && draft.apiKey.isNotBlank() && draft.model.isNotBlank(), onClick = { model.checkApi(draft, false) }) { Text("测试所选模型") }
         }

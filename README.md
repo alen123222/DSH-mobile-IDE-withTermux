@@ -4,7 +4,7 @@
 
 DSH Pocket 将 Kotlin / Jetpack Compose 界面、手机本地执行服务和适配 Android arm64 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 连接起来。可以在聊天中让模型操作项目，也可以直接打开终端，执行命令、安装工具、编译代码。
 
-当前版本：**0.2.0-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
+当前版本：**0.3.0-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
 
 ## 目录
 
@@ -38,6 +38,10 @@ DSH Pocket 将 Kotlin / Jetpack Compose 界面、手机本地执行服务和适�
 | 地址补全 | 支持基础地址或完整请求地址，自动处理协议后缀 |
 | 密钥存储 | Android Keystore + AES-GCM 加密保存 API 配置 |
 | 会话记录 | 保存聊天和工具活动，重启后的旧会话可查看 |
+| 星标与删除 | 工作区和对话均可置顶星标、随时删除；删除对话不触碰项目文件 |
+| 实时推送 | 会话事件经 SSE 推送；不可用时自动退回按修订号的增量轮询 |
+| 断点续用 | 停止后的会话可以继续提问，无需新建；损坏的记录会被隔离而不是让服务起不来 |
+| 模型能力 | 每个 API 预设可设置上下文长度与单次输出上限 |
 
 已验证的关键链路：
 
@@ -444,6 +448,8 @@ Android loader 替代了缺少 Android 预编译包的 `node-addon-require-built
 - 文件页目前以浏览和预览为主，尚无完整编辑器、Git diff 审阅和冲突处理界面。
 - 预设不自动推断模型的全部能力；复杂 reasoning、图像、音频及特殊扩展可能需进一步适配。
 - 工具执行授权为会话级，尚未实现逐条审批。
+- 助手消息按整条推送，尚未逐 token 渲染。
+- 删除工作区只移除列表记录；项目文件始终保留在原处。
 - 未内置 Android SDK、Rust 等全部工具链，可按项目需求在 Termux 中安装。
 - 上游版本固定，更新需重新检查补丁并做真机验证。
 

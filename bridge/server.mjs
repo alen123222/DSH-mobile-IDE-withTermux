@@ -9,6 +9,25 @@ import { Workspaces } from './workspaces.mjs';
 import { Terminals } from './terminals.mjs';
 import { DshSessions } from './dsh.mjs';
 
+// Server-Sent Events. The DSH session events already arrive live in dsh.mjs;
+// this only gives the phone a push channel instead of a 900 ms poll. The
+// connection is a plain HTTP request, so it must be exempt from requestTimeout.
+function stream(req, res, chats, id) {
+  const item = chats.get(id);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform',
+    Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.write(': pocket stream open\n\n');
+  const send = snapshot => {
+    if (snapshot.status === 'deleted') { res.write('event: deleted\ndata: {}\n\n'); return; }
+    res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
+  };
+  const unsubscribe = chats.subscribe(item, send);
+  const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* Closed. */ } }, 20000);
+  keepAlive.unref?.();
+  const done = () => { clearInterval(keepAlive); unsubscribe(); };
+  req.on('close', done); req.on('error', done); res.on('error', done);
+}
+
 async function bodyOf(request) {
   if (!request.headers['content-type']?.startsWith('application/json')) throw new ApiError(415, '请求必须为 JSON');
   let size = 0; const chunks = [];
@@ -41,14 +60,15 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       if (parts[0] !== 'v1') throw new ApiError(404, '接口不存在');
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
-      if (method === 'GET' && parts[1] === 'health') result = { version: '0.2.0', platform: process.platform, arch: process.arch,
+      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.0', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
       else if (method === 'GET' && parts[1] === 'browse') result = workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
       else if (method === 'POST' && parts[1] === 'directories') result = workspaces.create(body.parent, body.name);
       else if (method === 'GET' && parts[1] === 'workspaces') result = { items: workspaces.all() };
-      else if (method === 'POST' && parts[1] === 'workspaces') result = workspaces.add(body.path);
-      else if (method === 'DELETE' && parts[1] === 'workspaces') { workspaces.remove(parts[2]); result = { ok: true }; }
+      else if (method === 'POST' && parts[1] === 'workspaces' && !parts[2]) result = workspaces.add(body.path);
+      else if (method === 'DELETE' && parts[1] === 'workspaces' && parts[2]) { workspaces.remove(parts[2]); result = { ok: true }; }
+      else if (method === 'POST' && parts[1] === 'workspaces' && parts[3] === 'star') result = workspaces.star(parts[2], body.starred);
       else if (method === 'GET' && parts[1] === 'file') result = workspaces.read(url.searchParams.get('workspaceId'), url.searchParams.get('path'));
       else if (method === 'POST' && parts[1] === 'terminals' && !parts[2]) result = terminals.open(workspaces.get(body.workspaceId));
       else if (method === 'GET' && parts[1] === 'terminals') {
@@ -59,9 +79,13 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       else if (method === 'DELETE' && parts[1] === 'terminals') { terminals.close(parts[2]); result = { ok: true }; }
       else if (method === 'GET' && parts[1] === 'chats' && !parts[2]) result = { items: chats.list(url.searchParams.get('workspaceId')) };
       else if (method === 'POST' && parts[1] === 'chats' && !parts[2]) result = chats.create(workspaces.get(body.workspaceId));
-      else if (method === 'GET' && parts[1] === 'chats' && parts[2]) result = chats.snapshot(chats.get(parts[2]));
+      else if (method === 'GET' && parts[1] === 'chats' && parts[3] === 'stream') return stream(req, res, chats, parts[2]);
+      else if (method === 'GET' && parts[1] === 'chats' && parts[2]) result = chats.delta(parts[2], Number(url.searchParams.get('since')));
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'prompt') result = await chats.prompt(parts[2], body);
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'stop') result = chats.stop(parts[2]);
+      else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'resume') result = chats.resume(parts[2]);
+      else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'star') result = chats.star(parts[2], body.starred);
+      else if (method === 'DELETE' && parts[1] === 'chats' && parts[2]) result = chats.remove(parts[2]);
       else throw new ApiError(404, '接口不存在');
       send(200, result);
     } catch (error) {
@@ -71,6 +95,7 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
   });
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
+  server.setTimeout(0); // Long-lived SSE connections must not be reaped.
   server.on('close', () => { terminals.closeAll(); chats.closeAll(); });
   return { server, workspaces, terminals, chats };
 }

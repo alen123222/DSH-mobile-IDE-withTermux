@@ -10,7 +10,8 @@ export class Workspaces {
     this.items = readJson(this.filename, []);
   }
   all() {
-    return this.items.map(item => ({ ...item, available: fs.existsSync(item.path) }));
+    return this.items.map(item => ({ ...item, available: fs.existsSync(item.path) }))
+      .sort((a, b) => Number(Boolean(b.starred)) - Number(Boolean(a.starred)));
   }
   get(id) {
     const item = this.items.find(item => item.id === id);
@@ -22,14 +23,23 @@ export class Workspaces {
     const canonical = directory(location);
     const existing = this.items.find(item => item.path === canonical);
     if (existing) return existing;
-    const item = { id: crypto.randomUUID(), path: canonical, name: path.basename(canonical) || canonical };
+    const item = { id: crypto.randomUUID(), path: canonical, name: path.basename(canonical) || canonical, starred: false };
     this.items.push(item);
     writeJson(this.filename, this.items);
     return item;
   }
   remove(id) {
+    const before = this.items.length;
     this.items = this.items.filter(item => item.id !== id);
+    if (this.items.length === before) throw new ApiError(404, '工作区不存在');
     writeJson(this.filename, this.items);
+  }
+  star(id, value) {
+    const item = this.items.find(item => item.id === id);
+    if (!item) throw new ApiError(404, '工作区不存在');
+    item.starred = value === true;
+    writeJson(this.filename, this.items);
+    return { ...item, available: fs.existsSync(item.path) };
   }
   browse(location = os.homedir(), dirsOnly = false) {
     const canonical = directory(location);

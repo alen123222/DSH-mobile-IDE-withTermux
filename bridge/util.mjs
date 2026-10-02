@@ -30,8 +30,16 @@ export function writeJson(filename, value) {
   }
 }
 export function readJson(filename, fallback) {
-  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); }
+  let raw;
+  try { raw = fs.readFileSync(filename, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
+  try { return JSON.parse(raw); }
+  catch {
+    // A truncated write (battery pull, OOM kill) must never make the phone
+    // unrecoverable. Keep the damaged bytes next to the file, then continue.
+    try { fs.renameSync(filename, `${filename}.corrupt-${Date.now()}`); } catch { /* Already gone or read-only. */ }
+    return fallback;
+  }
 }
 export function executable(name) {
   if (path.isAbsolute(name)) return fs.existsSync(name) ? name : null;

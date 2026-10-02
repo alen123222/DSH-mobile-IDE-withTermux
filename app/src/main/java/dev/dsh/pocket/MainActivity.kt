@@ -77,7 +77,9 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
         val panel: @Composable () -> Unit = {
             Sidebar(state, onSelect = { model.select(it); scope.launch { drawer.close() }; tab = 0 },
                 onAdd = addWorkspace, onChat = { model.openChat(it); tab = 0; scope.launch { drawer.close() } },
-                onNew = { model.newChat(); tab = 0; scope.launch { drawer.close() } }, onSettings = { tab = 3; scope.launch { drawer.close() } })
+                onNew = { model.newChat(); tab = 0; scope.launch { drawer.close() } }, onSettings = { tab = 3; scope.launch { drawer.close() } },
+                onStarChat = model::starChat, onDeleteChat = model::deleteChat,
+                onStarWorkspace = model::starWorkspace, onDeleteWorkspace = model::deleteWorkspace)
         }
         val content: @Composable () -> Unit = {
             Scaffold(containerColor = Surface, snackbarHost = { SnackbarHost(snackbar) }, topBar = {
@@ -134,7 +136,13 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
 }
 
 @Composable
-private fun Sidebar(state: PocketState, onSelect: (Workspace) -> Unit, onAdd: () -> Unit, onChat: (String) -> Unit, onNew: () -> Unit, onSettings: () -> Unit) {
+private fun Sidebar(state: PocketState, onSelect: (Workspace) -> Unit, onAdd: () -> Unit, onChat: (String) -> Unit,
+                    onNew: () -> Unit, onSettings: () -> Unit, onStarChat: (JSONObject) -> Unit,
+                    onDeleteChat: (JSONObject) -> Unit, onStarWorkspace: (Workspace) -> Unit, onDeleteWorkspace: (Workspace) -> Unit) {
+    var chatMenu by remember { mutableStateOf<JSONObject?>(null) }
+    var workspaceMenu by remember { mutableStateOf<Workspace?>(null) }
+    var chatDelete by remember { mutableStateOf<JSONObject?>(null) }
+    var workspaceDelete by remember { mutableStateOf<Workspace?>(null) }
     Column(Modifier.fillMaxSize().background(Color(0xFFF0F3F9)).padding(18.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 12.dp)) {
             Surface(color = Blue, shape = RoundedCornerShape(12.dp)) { Icon(Icons.Outlined.Terminal, null, tint = Color.White, modifier = Modifier.padding(10.dp)) }
@@ -155,19 +163,34 @@ private fun Sidebar(state: PocketState, onSelect: (Workspace) -> Unit, onAdd: ()
             items(state.workspaces, key = { it.id }) { workspace ->
                 Surface(color = if (state.selected?.id == workspace.id) Color.White else Color.Transparent, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().clickable { onSelect(workspace) }) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Outlined.Folder, null, tint = if (workspace.available) Blue else Color.Gray, modifier = Modifier.size(20.dp))
-                        Column(Modifier.padding(start = 10.dp)) {
+                        Icon(if (workspace.starred) Icons.Outlined.Star else Icons.Outlined.Folder, null,
+                            tint = if (workspace.starred) Color(0xFFE0A800) else if (workspace.available) Blue else Color.Gray, modifier = Modifier.size(20.dp))
+                        Column(Modifier.padding(start = 10.dp).weight(1f)) {
                             Text(workspace.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
                             Text(workspace.path, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color(0xFF64748B), style = MaterialTheme.typography.labelSmall)
+                        }
+                        IconButton(onClick = { workspaceMenu = workspace }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Outlined.MoreVert, "工作区操作", modifier = Modifier.size(17.dp), tint = Color(0xFF94A3B8))
                         }
                     }
                 }
             }
             item { Text("最近对话", color = Color(0xFF64748B), style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 24.dp, bottom = 8.dp)) }
             items(state.chats, key = { it.string("id") }) { chat ->
+                val starred = chat.optBoolean("starred", false)
                 Row(Modifier.fillMaxWidth().clickable { onChat(chat.getString("id")) }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.ChatBubbleOutline, null, modifier = Modifier.size(16.dp), tint = Color(0xFF64748B))
-                    Text(chat.string("title"), modifier = Modifier.padding(start = 10.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                    Icon(if (starred) Icons.Outlined.Star else Icons.Outlined.ChatBubbleOutline, null,
+                        modifier = Modifier.size(16.dp), tint = if (starred) Color(0xFFE0A800) else Color(0xFF64748B))
+                    Column(Modifier.padding(start = 10.dp).weight(1f)) {
+                        Text(chat.string("title"), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                        val status = chat.string("status")
+                        if (status == "running" || status == "error") Text(
+                            if (status == "running") "运行中" else "出错", style = MaterialTheme.typography.labelSmall,
+                            color = if (status == "running") Blue else MaterialTheme.colorScheme.error)
+                    }
+                    IconButton(onClick = { chatMenu = chat }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Outlined.MoreVert, "对话操作", modifier = Modifier.size(16.dp), tint = Color(0xFF94A3B8))
+                    }
                 }
             }
         }
@@ -175,6 +198,35 @@ private fun Sidebar(state: PocketState, onSelect: (Workspace) -> Unit, onAdd: ()
         TextButton(onClick = onSettings, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Outlined.Tune, null); Spacer(Modifier.width(8.dp)); Text("连接与模型设置") }
         Text("${BuildConfig.VERSION_NAME} · 开发预览", style = MaterialTheme.typography.labelSmall, color = Color(0xFF94A3B8), modifier = Modifier.padding(12.dp))
     }
+    chatMenu?.let { chat ->
+        DropdownMenu(expanded = true, onDismissRequest = { chatMenu = null }) {
+            DropdownMenuItem(text = { Text(if (chat.optBoolean("starred", false)) "取消星标" else "星标置顶") },
+                leadingIcon = { Icon(if (chat.optBoolean("starred", false)) Icons.Outlined.Star else Icons.Outlined.StarBorder, null) },
+                onClick = { chatMenu = null; onStarChat(chat) })
+            DropdownMenuItem(text = { Text("删除对话") }, leadingIcon = { Icon(Icons.Outlined.Delete, null) },
+                onClick = { chatMenu = null; chatDelete = chat })
+        }
+    }
+    workspaceMenu?.let { workspace ->
+        DropdownMenu(expanded = true, onDismissRequest = { workspaceMenu = null }) {
+            DropdownMenuItem(text = { Text(if (workspace.starred) "取消星标" else "星标置顶") },
+                leadingIcon = { Icon(if (workspace.starred) Icons.Outlined.Star else Icons.Outlined.StarBorder, null) },
+                onClick = { workspaceMenu = null; onStarWorkspace(workspace) })
+            DropdownMenuItem(text = { Text("从列表移除") },
+                leadingIcon = { Icon(Icons.Outlined.FolderOff, null) },
+                onClick = { workspaceMenu = null; workspaceDelete = workspace })
+        }
+    }
+    chatDelete?.let { chat -> AlertDialog(onDismissRequest = { chatDelete = null },
+        title = { Text("删除这个对话？") },
+        text = { Text("「${chat.string("title")}」的消息与工具记录会一并删除，项目文件不受影响。") },
+        confirmButton = { TextButton(onClick = { chatDelete = null; onDeleteChat(chat) }) { Text("删除", color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = { chatDelete = null }) { Text("取消") } }) }
+    workspaceDelete?.let { workspace -> AlertDialog(onDismissRequest = { workspaceDelete = null },
+        title = { Text("从列表移除工作区？") },
+        text = { Text("${workspace.path}\n\n只会移除这条记录，磁盘上的项目文件不会被删除。") },
+        confirmButton = { TextButton(onClick = { workspaceDelete = null; onDeleteWorkspace(workspace) }) { Text("移除", color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = { workspaceDelete = null }) { Text("取消") } }) }
 }
 
 @Composable
@@ -217,10 +269,18 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
         if (events.isNotEmpty()) TextButton(onClick = { showEvents = true }, modifier = Modifier.padding(start = 16.dp)) {
             Icon(Icons.Outlined.DataObject, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("查看工具活动 · ${events.size}")
         }
-        if (status in listOf("archived", "stopped", "error")) {
+        if (status in listOf("stopped", "error")) {
             Surface(color = Color(0xFFF0F3F9), modifier = Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("此会话已结束，记录已保存。", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                    Text(if (status == "stopped") "任务已停止，记录已保存。可以继续在这个对话里提问。" else "本次运行出错，记录已保存。",
+                        modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { model.newChat() }) { Text("新建会话") }
+                }
+            }
+        } else if (status == "archived") {
+            Surface(color = Color(0xFFF0F3F9), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("这是上次运行留下的记录，只读。", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                     TextButton(onClick = { model.newChat() }) { Text("新建会话") }
                 }
             }

@@ -6,6 +6,8 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { createBridge } from '../bridge/server.mjs';
+import { DshSessions } from '../bridge/dsh.mjs';
+import { connectionSettings, writeProviderPatch } from '../bridge/providers.mjs';
 
 async function setup(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocket-test-'));
@@ -17,8 +19,10 @@ async function setup(t) {
   bridge.server.listen(0, '127.0.0.1');
   await once(bridge.server, 'listening');
   const base = `http://127.0.0.1:${bridge.server.address().port}/v1/`;
-  async function request(route, { method = 'GET', body, headers = {} } = {}) {
-    const response = await fetch(base + route, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const stateDir = path.join(root, 'private');
+  async function request(route, { method = 'GET', body, headers = {}, query } = {}) {
+    const url = query ? `${base}${route}?${new URLSearchParams(query)}` : base + route;
+    const response = await fetch(url, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
     return { status: response.status, body: await response.json() };
   }
   t.after(async () => {
@@ -28,7 +32,7 @@ async function setup(t) {
     await new Promise(resolve => bridge.server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
   });
-  return { root, projects, token, bridge, request };
+  return { root, projects, token, bridge, request, stateDir, base };
 }
 
 test('local execution API requires pairing token and rejects browser origins', async t => {
@@ -107,7 +111,7 @@ test('DSH protocol handles receipt races, isolates cwd, and continues live conve
   assert.match(changed.body.error, /新建会话/);
 });
 
-test('stop terminates the owned runtime and preserves the transcript', async t => {
+test('stop terminates the owned runtime, preserves the transcript and allows resuming', async t => {
   const { request, projects, bridge } = await setup(t);
   const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
   const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
@@ -120,7 +124,134 @@ test('stop terminates the owned runtime and preserves the transcript', async t =
   const transcript = (await request(`chats/${chat.id}`)).body;
   assert.equal(transcript.messages[0].text, 'wait');
   assert.ok(!JSON.stringify(transcript).includes('SECRET-NOT-ON-DISK'));
-  assert.equal((await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'again', model: 'test', allowExecution: true } })).status, 409);
+  // A stopped session used to be permanently dead. It must now resume.
+  assert.equal((await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'again', model: 'test', apiKey: 'SECRET-NOT-ON-DISK', allowExecution: true } })).status, 200);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+});
+
+test('workspaces and chats can be starred and deleted', async t => {
+  const { request, projects } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  assert.equal(workspace.starred, false);
+  const starred = (await request(`workspaces/${workspace.id}/star`, { method: 'POST', body: { starred: true } })).body;
+  assert.equal(starred.starred, true);
+  assert.equal((await request('workspaces')).body.items[0].starred, true, 'starred workspaces sort first');
+  assert.equal((await request(`workspaces/${workspace.id}/star`, { method: 'POST', body: { starred: false } })).body.starred, false);
+
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  const starredChat = (await request(`chats/${chat.id}/star`, { method: 'POST', body: { starred: true } })).body;
+  assert.equal(starredChat.starred, true);
+  assert.equal((await request('chats', { query: { workspaceId: workspace.id } })).body.items[0].id, chat.id);
+
+  // Unchanged sessions answer with a tiny delta object instead of the full history.
+  const revision = (await request(`chats/${chat.id}`)).body.revision;
+  assert.equal((await request(`chats/${chat.id}`, { query: { since: String(revision) } })).body.unchanged, true);
+
+  assert.equal((await request(`chats/${chat.id}`, { method: 'DELETE' })).status, 200);
+  assert.equal((await request(`chats/${chat.id}`)).status, 404);
+  // Deleting a workspace only removes the record; the directory stays on disk.
+  assert.equal((await request(`workspaces/${workspace.id}`, { method: 'DELETE' })).status, 200);
+  assert.equal((await request(`workspaces/${workspace.id}`, { method: 'DELETE' })).status, 404);
+  const { statSync } = await import('node:fs');
+  assert.ok(statSync(projects[0]).isDirectory());
+});
+
+test('a running session cannot be deleted out from under the engine', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'wait', model: 'test', apiKey: 'SECRET-NOT-ON-DISK', allowExecution: true } });
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(bridge.chats.get(chat.id).status, 'running');
+  assert.equal((await request(`chats/${chat.id}`, { method: 'DELETE' })).status, 409);
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+});
+
+test('a corrupt state file is quarantined instead of blocking startup', async t => {
+  const { request, projects, stateDir } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  fs.mkdirSync(path.join(stateDir, 'chats'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'chats', 'pocket-broken.json'), '{"id":"pocket-broken","title":"截断');
+  const sessions = new DshSessions(stateDir, {});
+  assert.equal(sessions.sessions.has('pocket-broken'), false, 'unreadable records are dropped');
+  assert.equal(fs.readdirSync(path.join(stateDir, 'chats')).filter(name => name.includes('corrupt')).length, 1,
+    'damaged bytes are kept for inspection');
+  assert.equal((await request('health')).status, 200);
+  assert.equal(workspace.path, projects[0]);
+});
+
+test('model limits reach the provider patch and reject junk', async t => {
+  const { projects } = await setup(t);
+  const { modelLimits } = await import('../bridge/providers.mjs');
+  assert.deepEqual(modelLimits({}), { contextWindow: 131072, maxTokens: 8192 });
+  assert.deepEqual(modelLimits({ contextWindow: '1048576', maxTokens: '64000' }), { contextWindow: 1048576, maxTokens: 64000 });
+  // Out-of-range and junk input falls back rather than reaching the engine.
+  assert.deepEqual(modelLimits({ contextWindow: 10, maxTokens: 'abc' }), { contextWindow: 131072, maxTokens: 8192 });
+  assert.deepEqual(modelLimits({ contextWindow: 99_999_999, maxTokens: 999_999 }), { contextWindow: 4194304, maxTokens: 131072 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocket-patch-'));
+  const settings = { ...connectionSettings({ model: 'test', protocol: 'openai-chat', baseUrl: 'https://api.example.com/v1', apiKey: 'k', contextWindow: 1000000, maxTokens: 32000 }) };
+  const file = writeProviderPatch(dir, 'probe', settings);
+  const patch = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const models = patch[1].insert[0].config.providers['pocket-openai'].models;
+  assert.equal(models[0].contextWindow, 1000000);
+  assert.equal(models[0].maxTokens, 32000);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the SSE channel pushes snapshots and reports deletion', async t => {
+  const { request, projects, base, token } = await setup(t);
+  const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
+  const { body: chat } = await request('chats', { method: 'POST', body: { workspaceId: workspace.id } });
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const response = await fetch(`${base}chats/${chat.id}/stream`,
+    { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /text\/event-stream/);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const queue = [];
+  let notify = () => {};
+  (async () => {
+    let buffer = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let index;
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, index);
+          buffer = buffer.slice(index + 2);
+          const data = frame.split('\n').find(line => line.startsWith('data: '));
+          if (!data) continue; // Comment line, e.g. the opening handshake or a keep-alive.
+          const event = frame.split('\n').find(line => line.startsWith('event: '));
+          queue.push({ event: event ? event.substring(7).trim() : 'message',
+            data: JSON.parse(data.substring(6)) });
+          notify();
+        }
+      }
+    } catch { /* Aborted at teardown. */ }
+  })();
+  const nextEvent = async (timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (queue.length === 0) {
+      if (Date.now() > deadline) return null;
+      await new Promise(resolve => { notify = () => { notify = () => {}; resolve(); }; setTimeout(resolve, 100); });
+    }
+    return queue.shift();
+  };
+  // The bridge sends the current snapshot immediately on subscribe.
+  const first = await nextEvent();
+  assert.equal(first.event, 'message');
+  assert.equal(first.data.id, chat.id);
+  await request(`chats/${chat.id}/star`, { method: 'POST', body: { starred: true } });
+  const starred = await nextEvent();
+  assert.equal(starred.data.starred, true, 'a state change pushes without any polling');
+  await request(`chats/${chat.id}`, { method: 'DELETE' });
+  assert.equal((await nextEvent()).event, 'deleted', 'deleting a session tells its open stream');
+  controller.abort();
 });
 
 test('real PTY retains cd and shell variables across inputs', { skip: process.platform === 'win32' }, async t => {
