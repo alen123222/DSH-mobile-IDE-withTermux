@@ -5,6 +5,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.net.ConnectException
+import java.net.Proxy
+import java.net.URI
 
 /**
  * Regression cover for "Termux reports the service healthy but the app cannot
@@ -67,6 +69,41 @@ class BridgeHostProbeTest {
         assertEquals("127.0.0.1", candidates.first())
         assertTrue(candidates.contains("localhost"))
         assertTrue(candidates.size >= 2)
+    }
+
+    @Test
+    fun `an html body is reported as a proxy interception`() {
+        // This is the exact failure the device reported: JSONException on an
+        // <html> body, with Termux meanwhile reporting a healthy service.
+        val error = runCatching { decodeText("<html><body><h4>Error</h4>", 200) }
+            .exceptionOrNull()!!
+        assertTrue(error.message!!.contains("HTML"))
+        assertTrue(error.message!!.contains("代理"))
+        assertTrue(describe(error).contains("代理"))
+    }
+
+    @Test
+    fun `invalid json names the body instead of failing opaquely`() {
+        val error = runCatching { decodeText("not json at all", 502) }.exceptionOrNull()!!
+        assertTrue(error.message!!.contains("不是有效 JSON"))
+        assertTrue(error.message!!.contains("not json"))
+        assertTrue(describe(error).contains("不是有效 JSON"))
+    }
+
+    @Test
+    fun `a json error body is surfaced verbatim`() {
+        val error = runCatching { decodeText("""{"error":"连接密钥不匹配"}""", 401) }.exceptionOrNull()!!
+        assertEquals("连接密钥不匹配", error.message)
+        assertTrue(describe(error).contains("密钥"))
+    }
+
+    @Test
+    fun `no proxy is ever selected`() {
+        // A system proxy must never be used: the bridge is on this device's own
+        // loopback, and Termux (raw sockets) proves the service is reachable there.
+        val selected = NO_PROXY.select(URI("http://127.0.0.1:8765/v1/health"))
+        assertEquals(listOf(Proxy.NO_PROXY), selected)
+        assertEquals(listOf(Proxy.NO_PROXY), NO_PROXY.select(URI("http://example.com/")))
     }
 
     @Test

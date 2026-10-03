@@ -10,9 +10,23 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.SocketAddress
+import java.net.URI
 import java.util.concurrent.TimeUnit
 
 const val BRIDGE_VERSION = "0.3.3"
+
+/**
+ * Never route through a proxy. The bridge only listens on this device's own
+ * loopback, so a proxy can only break the connection. ProxySelector.of needs
+ * API 24 desugaring that this minSdk does not need, so implement it directly.
+ */
+internal val NO_PROXY: ProxySelector = object : ProxySelector() {
+    override fun select(uri: URI): List<Proxy> = listOf(Proxy.NO_PROXY)
+    override fun connectFailed(uri: URI?, sa: SocketAddress?, io: IOException?) = Unit
+}
 
 class BridgeApi(internal val token: String) {
     // A VPN or a per-app proxy can capture an app's traffic while leaving Termux
@@ -34,11 +48,21 @@ class BridgeApi(internal val token: String) {
     // Listing shared storage over Android's FUSE mount can take tens of seconds
     // on a phone full of photos. 12 s made the file browser grey out and time out
     // on perfectly ordinary folders, so browse/directory work gets its own budget.
+    // The bridge only ever listens on the device's own loopback, so a proxy can
+    // only ever break the connection. OkHttp otherwise honours the system-wide
+    // proxy (a manual Wi-Fi/APN proxy, a "no VPN" claim notwithstanding), and
+    // sends 127.0.0.1:8765 to that proxy. The proxy answers with an HTML error
+    // page, which surfaces as a JSONException on an <html> body while Termux,
+    // using raw sockets, still reaches the service fine.
     private val client = OkHttpClient.Builder().connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS).callTimeout(60, TimeUnit.SECONDS).build()
+        .readTimeout(45, TimeUnit.SECONDS).callTimeout(60, TimeUnit.SECONDS)
+        .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
     // A separate client: the SSE channel must never inherit the 12 s read timeout.
     internal val streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS).retryOnConnectionFailure(true).build()
+        .readTimeout(0, TimeUnit.MILLISECONDS).retryOnConnectionFailure(true)
+        .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
+
+    internal fun decode(response: Response): JSONObject = decodeText(response.body?.string().orEmpty(), response.code)
 
     /**
      * Find a local address this process can actually reach.
@@ -61,11 +85,7 @@ class BridgeApi(internal val token: String) {
     fun callOn(target: String, route: String): JSONObject {
         val url = "http://$target:8765/v1/$route".toHttpUrl()
         val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
-        client.newCall(request).execute().use { response ->
-            val result = JSONObject(response.body?.string() ?: "{}")
-            if (!response.isSuccessful) throw IllegalStateException(result.optString("error", "连接失败 (${response.code})"))
-            return result
-        }
+        client.newCall(request).execute().use { response -> return decode(response) }
     }
 
     fun call(route: String, method: String = "GET", body: JSONObject? = null,
@@ -77,24 +97,34 @@ class BridgeApi(internal val token: String) {
             "POST" -> request.post((body ?: JSONObject()).toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             "DELETE" -> request.delete()
         }
-        client.newCall(request.build()).execute().use { response ->
-            val result = JSONObject(response.body?.string() ?: "{}")
-            if (!response.isSuccessful) throw IllegalStateException(result.optString("error", "连接失败 (${response.code})"))
-            return result
-        }
+        client.newCall(request.build()).execute().use { response -> return decode(response) }
     }
 }
 
 data class StreamFrame(val chat: JSONObject?, val deleted: Boolean)
 
-/** Find a local address this process can actually reach. Returns the winner or throws. */
-fun BridgeApi.probeHosts(candidates: List<String>, call: (String) -> Unit): String {
-var last: Throwable? = null
-for (candidate in candidates) {
-    try { call(candidate); return candidate }
-    catch (error: Throwable) { last = error }
-}
-throw last ?: IllegalStateException("no candidate host")
+/**
+ * Turn a raw response body into JSON, explaining the failure instead of letting
+ * org.json throw something unreadable.
+ *
+ * An HTML body means the request never reached this bridge: something else
+ * answered on the port, almost always a proxy. OkHttp honours the system proxy
+ * while Termux uses raw sockets, so Termux reports a healthy service while the
+ * app gets an error page.
+ */
+fun decodeText(text: String, code: Int): JSONObject {
+    if (text.trimStart().startsWith("<")) {
+        throw IllegalStateException(
+            "收到 HTML 而非 JSON（HTTP $code），请求未到达本地服务。" +
+            "通常是系统代理 / Wi-Fi 手动代理接管了 127.0.0.1:8765；" +
+            "请到 设置 → WLAN → 当前网络 → 高级 → 代理，改为「无」。"
+        )
+    }
+    val result = runCatching { JSONObject(text) }.getOrElse {
+        throw IllegalStateException("响应不是有效 JSON（HTTP $code）: ${text.take(120)}")
+    }
+    if (code !in 200..299) throw IllegalStateException(result.optString("error", "连接失败 ($code)"))
+    return result
 }
 
 /** Turn a transport failure into something a user can act on. */
@@ -107,6 +137,7 @@ fun describe(error: Throwable): String {
         detail.contains("timeout", true) || detail.contains("SocketTimeout", true) ->
             "连接超时，Termux 可能已被系统杀死"
         detail.contains("CLEARTEXT", true) -> "明文 HTTP 被系统策略拦截"
+        detail.contains("HTML", true) -> "请求被代理接管（收到 HTML 而非本地服务的 JSON）"
         detail.contains("401", true) || detail.contains("密钥", true) -> "配对密钥不匹配"
         detail.isBlank() -> type
         else -> "$type: $detail"

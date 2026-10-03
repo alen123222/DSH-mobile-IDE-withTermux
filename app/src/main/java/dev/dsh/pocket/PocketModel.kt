@@ -159,8 +159,8 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     mutable.update { it.copy(connected = false) }
                     if (start) error("本地服务无响应（$lastFailure；已尝试 ${api.candidates.joinToString("/")}）。" +
-                        "若 Termux 显示 local service already running，说明服务在跑但 App 连不上：" +
-                        "请检查 VPN/代理是否接管了本应用，或在 Termux 执行 pkill -f server.mjs 后重试。")
+                        "若 Termux 显示 local service already running，说明服务在跑但 App 连不上；" +
+                        "请到 设置 → WLAN → 当前网络 → 高级 → 代理 改为「无」，或重启手机后再试。")
                 }
             } catch (e: Exception) { error(describe(e)) }
             finally { mutable.update { it.copy(connecting = false) } }
