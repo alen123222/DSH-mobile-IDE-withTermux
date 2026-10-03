@@ -65,6 +65,42 @@ class BridgeApi(internal val token: String) {
     internal fun decode(response: Response): JSONObject = decodeText(response.body?.string().orEmpty(), response.code)
 
     /**
+     * A raw, unfiltered report of what this process actually sees.
+     *
+     * Termux reporting a healthy service proves nothing about the app: the app
+     * has its own HTTP stack, its own proxy handling and its own view of
+     * loopback. Guessing between those produced two wrong conclusions already,
+     * so show the status code, headers and first bytes verbatim instead.
+     */
+    fun probeReport(): String {
+        val report = StringBuilder()
+        val configured = runCatching {
+            ProxySelector.getDefault()?.select(URI("http://127.0.0.1:8765/v1/health"))
+                ?.joinToString(", ") { it.toString() }.orEmpty()
+        }.getOrElse { "查询失败: ${it.message}" }
+        report.appendLine("系统默认代理: ${configured.ifBlank { "(未设置)" }}")
+        report.appendLine("本应用强制: $NO_PROXY  (即永远直连)")
+        report.appendLine("密钥长度: ${token.length}")
+        for (candidate in candidates) {
+            report.appendLine("--- $candidate:8765 ---")
+            val request = Request.Builder().url("http://$candidate:8765/v1/health")
+                .header("Authorization", "Bearer $token").build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    report.appendLine("HTTP ${response.code} ${response.message}")
+                    report.appendLine("Content-Type: ${response.header("Content-Type")}")
+                    report.appendLine("Server: ${response.header("Server")}")
+                    report.appendLine("body[:180]: ${body.take(180).replace("\n", " ")}")
+                }
+            } catch (error: Throwable) {
+                report.appendLine("异常 ${error.javaClass.simpleName}: ${error.message}")
+            }
+        }
+        return report.toString()
+    }
+
+    /**
      * Find a local address this process can actually reach.
      *
      * A VPN or per-app proxy can capture the app's traffic while leaving Termux

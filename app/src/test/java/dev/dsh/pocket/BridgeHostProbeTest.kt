@@ -107,6 +107,18 @@ class BridgeHostProbeTest {
     }
 
     @Test
+    fun `the report names every host it tried`() {
+        // Guessing between "service dead" and "app cannot reach it" has been
+        // wrong twice, so the report must show each address and its raw result.
+        val report = BridgeApi("token").probeReport()
+        listOf("127.0.0.1", "localhost", "10.0.2.2").forEach { host ->
+            assertTrue("report must cover $host", report.contains("$host:8765"))
+        }
+        assertTrue(report.contains("系统默认代理"))
+        assertTrue(report.contains("body[:180]"))
+    }
+
+    @Test
     fun `the api exposes the address in use`() {
         val api = BridgeApi("token")
         assertEquals("127.0.0.1", api.address())

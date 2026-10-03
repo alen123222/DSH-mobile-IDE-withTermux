@@ -10,8 +10,8 @@ android {
         applicationId = "dev.dsh.pocket"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.3.5-dev"
+        versionCode = 9
+        versionName = "0.3.6-dev"
         testInstrumentationRunner = "dev.dsh.pocket.ProviderSmokeInstrumentation"
     }
     buildFeatures { compose = true; buildConfig = true }

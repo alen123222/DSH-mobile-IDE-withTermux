@@ -103,6 +103,14 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     /** The address actually in use, so a loopback workaround stays visible. */
     fun bridgeAddress(): String = api.address()
 
+    // Verbatim transport diagnostics. Termux can prove the service is healthy
+    // while the app still cannot reach it, and guessing between the possible
+    // causes has been wrong twice; this reports what the app really observes.
+    fun probeReport(onDone: (String) -> Unit) = viewModelScope.launch {
+        val report = withContext(Dispatchers.IO) { api.probeReport() }
+        onDone(report)
+    }
+
     fun connect(start: Boolean = true) {
         if (connecting?.isActive == true) return
         connecting = viewModelScope.launch {

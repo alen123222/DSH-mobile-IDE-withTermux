@@ -415,7 +415,13 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 Text(if (state.health?.string("dsh").isNullOrBlank()) "尚未检测到引擎" else "已发现 DSH · SDK 模式", color = Color(0xFF64748B))
                 Text("开发版先使用 DSH 的 sdk-minimal 配置，提供持久 Shell 和会话。模型可通过 Shell 读写代码、运行工具。", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text("安装 / 检查 Android 引擎") }
-                OutlinedButton(onClick = { safe { TermuxConnection.diagnose(context) } }) { Text("诊断本地服务连接") }
+                OutlinedButton(onClick = { safe { TermuxConnection.diagnose(context) } }) { Text("诊断 Termux 侧") }
+                var probe by remember { mutableStateOf("") }
+                OutlinedButton(onClick = { model.probeReport { probe = it } }) { Text("诊断 App 侧（网络原始信息）") }
+                if (probe.isNotBlank()) SelectionContainer {
+                    Text(probe, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()))
+                }
                 OutlinedButton(onClick = { safe { TermuxConnection.openTerminal(context, state.selected?.path ?: TermuxConnection.HOME) } }) { Text("打开原生 Termux 终端") }
             }
         }
