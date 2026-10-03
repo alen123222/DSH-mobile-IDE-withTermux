@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -347,16 +348,22 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
     var path by remember(state.browserPath) { mutableStateOf(state.browserPath) }
     var create by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
+    // Resolved server-side, so a shortcut that cannot exist is shown disabled
+    // instead of silently doing nothing when tapped.
+    LaunchedEffect(Unit) { model.loadShortcuts() }
     AlertDialog(onDismissRequest = dismiss, title = { Text("选择工作区目录") }, text = {
         Column(Modifier.fillMaxWidth()) {
             OutlinedTextField(path, { path = it }, label = { Text("绝对路径") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
                 trailingIcon = { IconButton(onClick = { model.browse(path, true) }) { Icon(Icons.Outlined.ArrowForward, "打开路径") } })
-            Row {
-                TextButton(onClick = { model.browse(state.health?.string("home").orEmpty(), true) }) { Text("主目录") }
-                TextButton(onClick = { model.browse("/sdcard", true) }) { Text("共享存储") }
-                TextButton(onClick = { model.browse("/storage/emulated/0", true) }) { Text("内部存储") }
-                TextButton(onClick = { model.browse(state.browserParent, true) }) { Text("上一级") }
+            LazyRow {
+                items(state.shortcuts, key = { it.path }) { item ->
+                    TextButton(onClick = { model.browse(item.path, true) }, enabled = item.available) {
+                        Text(item.label + if (item.available) "" else "（无权限）")
+                    }
+                }
             }
+            TextButton(onClick = { model.browseParent() },
+                enabled = state.browserParent.isNotBlank() && state.browserParent != state.browserPath) { Text("上一级") }
             // /sdcard only exists inside Termux after termux-setup-storage; without
             // that grant the picker could not see any ordinary phone folder.
             TextButton(onClick = grantStorage) {
@@ -364,7 +371,13 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
                 Text("手机里看不到其他文件夹？授权共享存储")
             }
             if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            LazyColumn(Modifier.height(260.dp)) {
+            // Say why a folder could not be listed, instead of leaving the pane
+            // blank and looking as though the taps were ignored.
+            if (!state.browserLoading && state.entries.isEmpty()) {
+                Text("此目录为空，或没有读取权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+            }
+            if (state.browserTruncated) Text("条目过多，仅显示前一部分。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+            LazyColumn(Modifier.height(240.dp)) {
                 items(state.entries.filter { it.directory }, key = { it.path }) { entry -> FileRow(entry) { model.browse(entry.path, true) } }
             }
             TextButton(onClick = { create = true }) { Icon(Icons.Outlined.CreateNewFolder, null); Spacer(Modifier.width(8.dp)); Text("在此新建文件夹") }

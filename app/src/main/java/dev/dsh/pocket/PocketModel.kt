@@ -18,11 +18,15 @@ import okhttp3.Call
 import org.json.JSONObject
 import java.util.UUID
 
+/** A well-known starting point, with whether this Termux can actually read it. */
+data class Shortcut(val label: String, val path: String, val available: Boolean)
+
 data class PocketState(
     val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
     val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
     val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
-    val browserLoading: Boolean = false, val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
+    val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
+    val shortcuts: List<Shortcut> = emptyList(), val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
     val settings: EngineSettings = EngineSettings(), val error: String? = null, val preview: JSONObject? = null,
     val consent: Boolean = false, val terminalId: String? = null,
     val presets: List<ApiPreset> = emptyList(), val activePresetId: String = "",
@@ -44,6 +48,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     private var connecting: Job? = null
     private var selectionRevision = 0
     private var browserRevision = 0
+    private var browseCall: Job? = null
     private var apiCheck: Job? = null
     private var apiRevision = 0
     private val providerClient = ProviderClient()
@@ -191,16 +196,58 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+    // Browsing shared storage is slow, and every tap used to fire a fresh
+    // request while the previous one was still running. The responses then
+    // arrived out of order, each discarded by the revision check, and the pane
+    // sat on a permanent spinner with every folder looking unresponsive.
+    // Cancel the in-flight call, keep one request at a time, and always clear
+    // the loading state.
     fun browse(path: String = "", dirsOnly: Boolean = false) {
+        if (browseCall?.isActive == true) browseCall?.cancel()
         val revision = ++browserRevision
         mutable.update { it.copy(browserLoading = true) }
-        task {
+        browseCall = viewModelScope.launch {
+            var loaded: JSONObject? = null
+            var failure: String? = null
             try {
-                val result = withContext(Dispatchers.IO) { api.call("browse", query = mapOf("path" to path, "dirs" to dirsOnly.toString())) }
-                if (revision == browserRevision) mutable.update { it.copy(browserPath = result.getString("path"), browserParent = result.getString("parent"), entries = result.objects("entries").map(FileEntry::from)) }
-            } finally { if (revision == browserRevision) mutable.update { it.copy(browserLoading = false) } }
+                loaded = withContext(Dispatchers.IO) {
+                    api.call("browse", query = mapOf("path" to path, "dirs" to dirsOnly.toString()))
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                failure = describe(error)
+            }
+            if (revision != browserRevision) return@launch
+            if (loaded != null) mutable.update { it.copy(
+                browserPath = loaded!!.getString("path"), browserParent = loaded!!.getString("parent"),
+                entries = loaded!!.objects("entries").map(FileEntry::from), browserTruncated = loaded!!.optBoolean("truncated")) }
+            else mutable.update { it.copy(entries = emptyList(), browserTruncated = false) }
+            failure?.let { error(it) }
+            mutable.update { it.copy(browserLoading = false) }
         }
     }
+    /** Go up one level. Kept separate so the parent path is never blank. */
+    fun browseParent() {
+        val parent = state.value.browserParent
+        if (parent.isBlank() || parent == state.value.browserPath) return
+        browse(parent)
+    }
+
+    /** Picker shortcuts, fetched off the main thread and cached in state. */
+    fun loadShortcuts() = viewModelScope.launch {
+        val items = runCatching {
+            withContext(Dispatchers.IO) {
+                api.call("shortcuts").objects("items").map {
+                    Shortcut(it.getString("label"), it.getString("path"), it.optBoolean("available"))
+                }
+            }
+        }.getOrElse {
+            listOf(Shortcut("主目录", "", false), Shortcut("内部存储", "/storage/emulated/0", false))
+        }
+        mutable.update { it.copy(shortcuts = items) }
+    }
+
     fun addWorkspace(path: String) = task {
         val workspace = withContext(Dispatchers.IO) { Workspace.from(api.call("workspaces", "POST", JSONObject().put("path", path))) }
         val all = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
@@ -355,20 +402,35 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             .sortedByDescending { it.starred }
         mutable.update { it.copy(workspaces = all) }
     }
-    fun deleteWorkspace(workspace: Workspace) = task {
-        withContext(Dispatchers.IO) { api.call("workspaces/${workspace.id}", "DELETE") }
-        val all = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+    fun deleteWorkspace(workspace: Workspace) {
+        // Optimistic: the row leaves the list immediately, and comes back only if
+        // the server refuses. Waiting for a round trip made every delete feel
+        // broken on shared storage, where a request can take many seconds.
         val wasSelected = state.value.selected?.id == workspace.id
-        mutable.update { it.copy(workspaces = all, selected = if (wasSelected) null else it.selected,
+        mutable.update { it.copy(
+            workspaces = it.workspaces.filterNot { item -> item.id == workspace.id },
+            selected = if (wasSelected) null else it.selected,
             chat = if (wasSelected) null else it.chat, chats = if (wasSelected) emptyList() else it.chats,
             entries = if (wasSelected) emptyList() else it.entries, browserPath = if (wasSelected) "" else it.browserPath,
             terminalId = if (wasSelected) null else it.terminalId) }
         if (wasSelected) {
             streaming = null
             streamCall?.cancel()
+        }
+        task {
+            withContext(Dispatchers.IO) { api.call("workspaces/${workspace.id}", "DELETE") }
+            val all = runCatching {
+                withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
+            }.getOrElse { return@task }
+            mutable.update { current ->
+                // A failed delete must not silently drop the row for good.
+                if (current.workspaces.any { it.id == workspace.id }) current
+                else current.copy(workspaces = all)
+            }
             // Only when the removed project was the active one do we move on to
             // a replacement. Removing some other workspace must leave the
             // current project, chat and terminal exactly as they were.
+            if (!wasSelected) return@task
             val next = mutable.value.workspaces.firstOrNull()
             if (next != null) select(next)
         }

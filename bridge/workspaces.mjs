@@ -44,28 +44,63 @@ export class Workspaces {
   }
   async browse(location = os.homedir(), dirsOnly = false) {
     const canonical = directory(location);
-    let names;
-    try { names = await fs.promises.readdir(canonical); }
+    let dirents;
+    try { dirents = await fs.promises.readdir(canonical, { withFileTypes: true }); }
     catch (error) {
-      if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有读取该目录的权限');
+      if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403,
+        '没有读取该目录的权限。共享存储需要先在 Termux 执行一次 termux-setup-storage。');
       if (error.code === 'ELOOP') throw new ApiError(400, '目录链接形成循环');
+      if (error.code === 'ENOENT') throw new ApiError(404, '目录不存在');
       throw error;
     }
     // Shared storage over Android's FUSE mount costs tens of milliseconds per
-    // entry. The old synchronous statSync loop blocked the whole event loop for
-    // seconds on a large folder, which starved /health and timed out the UI.
-    const settled = await Promise.all(names.map(name => fs.promises
-      .stat(path.join(canonical, name))
-      .then(stat => ({ name, stat }), () => null)));
-    const entries = settled.filter(Boolean)
-      .filter(({ stat }) => !(dirsOnly && !stat.isDirectory()))
-      .map(({ name, stat }) => ({ name, path: path.join(canonical, name),
-        directory: stat.isDirectory(), size: stat.size, symlink: false }))
+    // entry, and the old code statted every entry. A readdir with withFileTypes
+    // already carries the file type, so dirsOnly is answered without touching
+    // the filesystem at all, and sizes cost one stat only for real files.
+    // Do not resolve symlinks: on FUSE that costs a syscall per entry, and a
+    // link does not need following to appear in a listing.
+    let entries = dirents.map(entry => ({
+      name: entry.name,
+      path: path.join(canonical, entry.name),
+      directory: entry.isDirectory(),
+      size: -1,
+      symlink: entry.isSymbolicLink(),
+    }));
+    if (!dirsOnly) {
+      // File sizes need a stat each; keep that off the directory listing path.
+      const settled = await Promise.all(entries.map(entry =>
+        entry.symlink || entry.directory ? Promise.resolve(entry)
+          : fs.promises.stat(entry.path).then(stat => ({ ...entry, size: stat.size })).catch(() => entry)));
+      entries = settled;
+    }
+    entries = entries
+      .filter(entry => !(dirsOnly && !entry.directory))
       .sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name));
     const limit = this.options.browseLimit ?? 2000;
     return { path: canonical, parent: path.dirname(canonical), home: os.homedir(),
       entries: entries.slice(0, limit), truncated: entries.length > limit, total: entries.length };
   }
+  /** Well-known starting points for the picker, with availability resolved server-side. */
+  shortcuts() {
+    const home = os.homedir();
+    const candidates = [
+      { label: '主目录', path: home },
+      { label: '内部存储', path: '/storage/emulated/0' },
+      { label: '共享存储', path: '/sdcard' },
+      { label: 'Download', path: path.join(home, 'storage', 'downloads') },
+      { label: '根目录', path: '/' },
+    ];
+    const seen = new Set();
+    return candidates
+      .filter(item => !seen.has(item.path) && seen.add(item.path))
+      .map(item => {
+        let available = false;
+        try { available = fs.statSync(item.path).isDirectory(); }
+        catch { available = false; }
+        return { ...item, available };
+      });
+  }
+
   create(parent, name) {
     text(name, '目录名', 255);
     if (name === '.' || name === '..' || /[\\/]/.test(name)) throw new ApiError(400, '目录名不能包含路径分隔符');
