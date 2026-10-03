@@ -405,6 +405,7 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 }
                 if (state.connected && needsUpdate) Text("本地服务版本落后，将自动更新。更新会结束终端连接，保留工作区和对话记录。", style = MaterialTheme.typography.bodySmall)
                 state.health?.let { health -> Text("${health.string("arch")} · Node ${health.string("node")}\n${health.string("home")}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace) }
+                Text("连接地址：${model.bridgeAddress()}:8765", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
                 if (result.isNotBlank()) SelectionContainer { Text(result, style = MaterialTheme.typography.bodySmall, modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState())) }
             }
         }

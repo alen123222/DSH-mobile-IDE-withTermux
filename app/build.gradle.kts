@@ -10,8 +10,8 @@ android {
         applicationId = "dev.dsh.pocket"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.3-dev"
+        versionCode = 7
+        versionName = "0.3.4-dev"
         testInstrumentationRunner = "dev.dsh.pocket.ProviderSmokeInstrumentation"
     }
     buildFeatures { compose = true; buildConfig = true }
@@ -30,6 +30,7 @@ val bridgeAssets by tasks.registering(Copy::class) {
 }
 tasks.named("preBuild") { dependsOn(bridgeAssets) }
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation(platform("androidx.compose:compose-bom:2024.09.00"))
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.compose.ui:ui")

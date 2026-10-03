@@ -100,6 +100,9 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             finally { if (revision == apiRevision) mutable.update { it.copy(apiChecking = false) } }
         }
     }
+    /** The address actually in use, so a loopback workaround stays visible. */
+    fun bridgeAddress(): String = api.address()
+
     fun connect(start: Boolean = true) {
         if (connecting?.isActive == true) return
         connecting = viewModelScope.launch {
@@ -113,11 +116,24 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                     .onFailure { failure(describe(it)) }.getOrNull()
                 if (health == null && start) {
                     TermuxConnection.bootstrap(getApplication(), token)
+                    // Bootstrap returns immediately when a healthy service is
+                    // already up, so retry against every candidate address rather
+                    // than assuming loopback. A VPN can route the app's 127.0.0.1
+                    // away from the device while Termux still reaches it.
                     for (attempt in 0 until 30) {
                         delay(500)
                         health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
                             .onFailure { failure(describe(it)) }.getOrNull()
                         if (health != null) break
+                        if (attempt == 6 || attempt == 14) {
+                            val reachable = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    api.probeHosts().also { api.preferHost(it) }
+                                }
+                            }.onFailure { failure(describe(it)) }.getOrNull()
+                            if (reachable != null) health = api.call("health")
+                            if (health != null) break
+                        }
                     }
                 }
                 if (health != null && health.string("version") != BRIDGE_VERSION && start) {
@@ -142,9 +158,9 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                     if (state.value.selected == null && workspaces.isNotEmpty()) select(workspaces.first())
                 } else {
                     mutable.update { it.copy(connected = false) }
-                    if (start) error("本地服务无响应（$lastFailure）。若 Termux 显示" +
-                        "\"local service already running\"，说明服务在跑但 App 连不上；" +
-                        "请确认 Termux 未被系统杀死，或在 Termux 执行 pkill -f server.mjs 后重试。")
+                    if (start) error("本地服务无响应（$lastFailure；已尝试 ${api.candidates.joinToString("/")}）。" +
+                        "若 Termux 显示 local service already running，说明服务在跑但 App 连不上：" +
+                        "请检查 VPN/代理是否接管了本应用，或在 Termux 执行 pkill -f server.mjs 后重试。")
                 }
             } catch (e: Exception) { error(describe(e)) }
             finally { mutable.update { it.copy(connecting = false) } }

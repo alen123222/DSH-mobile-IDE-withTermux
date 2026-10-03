@@ -15,6 +15,22 @@ import java.util.concurrent.TimeUnit
 const val BRIDGE_VERSION = "0.3.3"
 
 class BridgeApi(internal val token: String) {
+    // A VPN or a per-app proxy can capture an app's traffic while leaving Termux
+    // alone, which sends the app's 127.0.0.1 somewhere other than the device's
+    // own loopback interface. Termux then reports a perfectly healthy service
+    // that the app can never reach. Probe the plausible local addresses once and
+    // remember whichever answers, rather than trusting loopback blindly.
+    @Volatile internal var host: String = "127.0.0.1"
+    internal val candidates = listOf("127.0.0.1", "localhost", "10.0.2.2")
+
+    /** Address currently in use; surfaced in the UI so a workaround is visible. */
+    fun address(): String = host
+
+    /** Remember a host that answered, so later calls skip the failing ones. */
+    internal fun preferHost(candidate: String) {
+        if (candidate != host) host = candidate
+    }
+
     // Listing shared storage over Android's FUSE mount can take tens of seconds
     // on a phone full of photos. 12 s made the file browser grey out and time out
     // on perfectly ordinary folders, so browse/directory work gets its own budget.
@@ -24,9 +40,37 @@ class BridgeApi(internal val token: String) {
     internal val streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS).retryOnConnectionFailure(true).build()
 
+    /**
+     * Find a local address this process can actually reach.
+     *
+     * A VPN or per-app proxy can capture the app's traffic while leaving Termux
+     * alone, so the app's own 127.0.0.1 never reaches the device loopback and a
+     * service Termux calls healthy looks dead here. Try each candidate in order
+     * and keep the first that answers; a thrown error means the host is unusable.
+     */
+    fun probeHosts(): String {
+        var last: Throwable? = null
+        for (candidate in candidates) {
+            try { callOn(candidate, "health"); return candidate }
+            catch (error: Throwable) { last = error }
+        }
+        throw last ?: IllegalStateException("no candidate host")
+    }
+
+    /** Try one call against a specific host without disturbing the preferred one. */
+    fun callOn(target: String, route: String): JSONObject {
+        val url = "http://$target:8765/v1/$route".toHttpUrl()
+        val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
+        client.newCall(request).execute().use { response ->
+            val result = JSONObject(response.body?.string() ?: "{}")
+            if (!response.isSuccessful) throw IllegalStateException(result.optString("error", "连接失败 (${response.code})"))
+            return result
+        }
+    }
+
     fun call(route: String, method: String = "GET", body: JSONObject? = null,
              query: Map<String, String> = emptyMap()): JSONObject {
-        val url = "http://127.0.0.1:8765/v1/$route".toHttpUrl().newBuilder()
+        val url = "http://$host:8765/v1/$route".toHttpUrl().newBuilder()
         query.forEach { (key, value) -> url.addQueryParameter(key, value) }
         val request = Request.Builder().url(url.build()).header("Authorization", "Bearer $token")
         when (method) {
@@ -42,6 +86,16 @@ class BridgeApi(internal val token: String) {
 }
 
 data class StreamFrame(val chat: JSONObject?, val deleted: Boolean)
+
+/** Find a local address this process can actually reach. Returns the winner or throws. */
+fun BridgeApi.probeHosts(candidates: List<String>, call: (String) -> Unit): String {
+var last: Throwable? = null
+for (candidate in candidates) {
+    try { call(candidate); return candidate }
+    catch (error: Throwable) { last = error }
+}
+throw last ?: IllegalStateException("no candidate host")
+}
 
 /** Turn a transport failure into something a user can act on. */
 fun describe(error: Throwable): String {
@@ -61,7 +115,7 @@ fun describe(error: Throwable): String {
 
 /** One SSE channel. Returns the Call so the caller can cancel it. */
 fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () -> Unit): Call {
-    val url = "http://127.0.0.1:8765/v1/chats/$id/stream".toHttpUrl()
+    val url = "http://$host:8765/v1/chats/$id/stream".toHttpUrl()
     val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
     val call = streamClient.newCall(request)
     call.enqueue(object : Callback {
