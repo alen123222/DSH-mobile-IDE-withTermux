@@ -81,7 +81,7 @@ export class Workspaces {
       entries: entries.slice(0, limit), truncated: entries.length > limit, total: entries.length };
   }
   /** Well-known starting points for the picker, with availability resolved server-side. */
-  shortcuts() {
+  async shortcuts() {
     const home = os.homedir();
     const candidates = [
       { label: '主目录', path: home },
@@ -91,14 +91,16 @@ export class Workspaces {
       { label: '根目录', path: '/' },
     ];
     const seen = new Set();
-    return candidates
-      .filter(item => !seen.has(item.path) && seen.add(item.path))
-      .map(item => {
-        let available = false;
-        try { available = fs.statSync(item.path).isDirectory(); }
-        catch { available = false; }
-        return { ...item, available };
-      });
+    const unique = candidates.filter(item => !seen.has(item.path) && seen.add(item.path));
+    // Reading a directory is the real test. A bare statSync on shared storage can
+    // fail where the directory itself opens fine, and reporting that as "no
+    // permission" would be wrong, so try to list it instead.
+    return await Promise.all(unique.map(async item => {
+      let available = false;
+      try { await fs.promises.readdir(item.path); available = true; }
+      catch { available = false; }
+      return { ...item, available };
+    }));
   }
 
   create(parent, name) {

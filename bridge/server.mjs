@@ -66,7 +66,7 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       if (parts[0] !== 'v1') throw new ApiError(404, '接口不存在');
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
-      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.7', platform: process.platform, arch: process.arch,
+      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.8', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
       else if (method === 'GET' && parts[1] === 'shortcuts') result = workspaces.shortcuts();

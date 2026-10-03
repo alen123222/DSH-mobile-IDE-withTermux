@@ -356,9 +356,11 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
             OutlinedTextField(path, { path = it }, label = { Text("绝对路径") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
                 trailingIcon = { IconButton(onClick = { model.browse(path, true) }) { Icon(Icons.Outlined.ArrowForward, "打开路径") } })
             LazyRow {
-                items(state.shortcuts, key = { it.path }) { item ->
+                items(state.shortcuts, key = { it.label }) { item ->
+                    // Only mark unavailable when the server actually said so. A
+                    // failed lookup must not present home as permission-denied.
                     TextButton(onClick = { model.browse(item.path, true) }, enabled = item.available) {
-                        Text(item.label + if (item.available) "" else "（无权限）")
+                        Text(if (item.available) item.label else "${item.label}（不可访问）")
                     }
                 }
             }

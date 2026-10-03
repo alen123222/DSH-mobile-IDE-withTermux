@@ -16,7 +16,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.3.7"
+const val BRIDGE_VERSION = "0.3.8"
 
 /**
  * Never route through a proxy. The bridge only listens on this device's own

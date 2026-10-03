@@ -56,14 +56,32 @@ test('a missing folder is reported as 404, not a crash', async () => {
   });
 });
 
-test('shortcuts mark unavailable paths instead of failing', () => {
+test('home and root are always available, sdcard may not be', async () => {
   const ws = new Workspaces(root, {});
-  const items = ws.shortcuts();
+  const items = await ws.shortcuts();
   assert.ok(items.length >= 3, 'expected several starting points');
-  assert.ok(items.some(item => item.path === '/sdcard'));
   assert.ok(items.every(item => typeof item.available === 'boolean'));
   assert.equal(new Set(items.map(item => item.path)).size, items.length, 'paths must be unique');
+  // Regression: these were reported as permission-denied, which made the home
+  // directory look inaccessible. The home of a running Termux is always readable.
+  assert.ok(items.find(item => item.path === os.homedir()).available, 'home must be available');
   assert.ok(items.find(item => item.path === '/').available, 'the root directory is always readable');
+  // /sdcard exists only after termux-setup-storage, so either answer is valid,
+  // but it must be a real boolean rather than a guess.
+  assert.ok(items.some(item => item.path === '/sdcard'));
+});
+
+test('a shortcut is tested by reading it, not by statSync alone', async () => {
+  // Android's FUSE mount can fail statSync where readdir succeeds, which would
+  // have reported a readable folder as forbidden.
+  const ws = new Workspaces(root, {});
+  const realStatSync = fs.statSync;
+  fs.statSync = () => { throw new Error('statSync refused'); };
+  let items;
+  try { items = await ws.shortcuts(); }
+  finally { fs.statSync = realStatSync; }
+  assert.ok(items.find(item => item.path === os.homedir()).available,
+    'home stays available even when statSync throws');
 });
 
 test('the parent of a top-level folder is itself and never blank', () => {

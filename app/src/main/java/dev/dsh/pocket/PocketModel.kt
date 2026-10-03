@@ -234,7 +234,15 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         browse(parent)
     }
 
-    /** Picker shortcuts, fetched off the main thread and cached in state. */
+    /**
+     * Picker shortcuts, fetched off the main thread and cached in state.
+     *
+     * The fallback must not claim a shortcut is unavailable: the server answers
+     * for the running Termux, and if this call fails the honest answer is "not
+     * known", not "no permission". A previous fallback marked every entry
+     * unavailable with an empty path, so a failed request rendered 主目录 as
+     * permanently disabled, which is why home appeared to have no permission.
+     */
     fun loadShortcuts() = viewModelScope.launch {
         val items = runCatching {
             withContext(Dispatchers.IO) {
@@ -243,7 +251,12 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }.getOrElse {
-            listOf(Shortcut("主目录", "", false), Shortcut("内部存储", "/storage/emulated/0", false))
+            // Unknown, not forbidden: keep them tappable so tapping still tries,
+            // and the browse call reports the real error if there is one. An
+            // empty path means "the server default", which is the same thing as
+            // home for this bridge, so it is not an empty target after all.
+            listOf(Shortcut("主目录", "", true), Shortcut("内部存储", "/storage/emulated/0", true),
+                Shortcut("共享存储", "/sdcard", true), Shortcut("根目录", "/", true))
         }
         mutable.update { it.copy(shortcuts = items) }
     }
