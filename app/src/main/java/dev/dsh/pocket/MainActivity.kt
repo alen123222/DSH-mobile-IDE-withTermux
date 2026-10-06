@@ -274,7 +274,7 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
                     Text(tr("描述任务，DSH 会在当前项目里工作。"), color = Color(0xFF64748B), modifier = Modifier.padding(top = 10.dp))
                 }
             }
-            items(timeline, key = { it.seq }) { item -> TimelineRow(item) }
+            items(timeline, key = { it.seq }) { item -> TimelineRow(item, running) }
             if (running) item { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text(tr("DSH 正在工作…"), modifier = Modifier.padding(start = 10.dp), color = Color(0xFF64748B)) } }
             if (chat.string("error").isNotBlank()) item { Text(chat.string("error"), color = MaterialTheme.colorScheme.error) }
         }
