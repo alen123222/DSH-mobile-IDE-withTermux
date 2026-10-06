@@ -69,7 +69,7 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.8', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
-      else if (method === 'GET' && parts[1] === 'shortcuts') result = workspaces.shortcuts();
+      else if (method === 'GET' && parts[1] === 'shortcuts') result = await workspaces.shortcuts();
       else if (method === 'GET' && parts[1] === 'browse') result = await workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
       else if (method === 'POST' && parts[1] === 'directories') result = workspaces.create(body.parent, body.name);
       else if (method === 'GET' && parts[1] === 'workspaces') result = { items: workspaces.all() };

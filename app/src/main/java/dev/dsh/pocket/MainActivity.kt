@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -330,7 +331,7 @@ private fun FilesPane(state: PocketState, model: PocketModel, onWorkspace: () ->
         }
         if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
         LazyColumn(Modifier.fillMaxSize()) {
-            items(state.entries, key = { it.path }) { entry -> FileRow(entry) { if (entry.directory) model.browse(entry.path) else model.preview(entry) } }
+            itemsIndexed(state.entries, key = { index, entry -> "${entry.path}_$index" }) { _, entry -> FileRow(entry) { if (entry.directory) model.browse(entry.path) else model.preview(entry) } }
         }
     }
 }
@@ -380,7 +381,7 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
             }
             if (state.browserTruncated) Text("条目过多，仅显示前一部分。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
             LazyColumn(Modifier.height(240.dp)) {
-                items(state.entries.filter { it.directory }, key = { it.path }) { entry -> FileRow(entry) { model.browse(entry.path, true) } }
+                itemsIndexed(state.entries.filter { it.directory }, key = { index, entry -> "${entry.path}_$index" }) { _, entry -> FileRow(entry) { model.browse(entry.path, true) } }
             }
             TextButton(onClick = { create = true }) { Icon(Icons.Outlined.CreateNewFolder, null); Spacer(Modifier.width(8.dp)); Text("在此新建文件夹") }
         }
