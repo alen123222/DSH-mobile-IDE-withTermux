@@ -4,7 +4,7 @@
 
 DSH Pocket 将 Kotlin / Jetpack Compose 界面、手机本地执行服务和适配 Android arm64 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 连接起来。可以在聊天中让模型操作项目，也可以直接打开终端，执行命令、安装工具、编译代码。
 
-当前版本：**0.4.3-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
+当前版本：**0.4.4-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
 
 ## 目录
 

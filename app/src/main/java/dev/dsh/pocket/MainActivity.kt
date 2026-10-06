@@ -258,8 +258,13 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
     val running = status == "running"
     var input by rememberSaveable(chat.string("id")) { mutableStateOf("") }
     var showEvents by remember { mutableStateOf(false) }
+    val timeline = remember(chat) { buildTimeline(chat) }
     val listState = rememberLazyListState()
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
+    // Follow the transcript only while the reader is already at the bottom;
+    // otherwise a poll would yank them back down mid-read.
+    LaunchedEffect(timeline.size) {
+        if (timeline.isNotEmpty() && !listState.canScrollForward) listState.animateScrollToItem(timeline.size - 1)
+    }
     Column(Modifier.fillMaxSize()) {
         LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(22.dp)) {
             if (messages.isEmpty()) item {
@@ -269,17 +274,7 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
                     Text(tr("描述任务，DSH 会在当前项目里工作。"), color = Color(0xFF64748B), modifier = Modifier.padding(top = 10.dp))
                 }
             }
-            items(messages, key = { it.string("id") }) { message ->
-                val user = message.string("role") == "user"
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (user) Arrangement.End else Arrangement.Start) {
-                    Surface(color = if (user) Color(0xFFE8EFFF) else Color.White, shape = RoundedCornerShape(18.dp), modifier = Modifier.widthIn(max = 740.dp)) {
-                        Column(Modifier.padding(18.dp)) {
-                            Text(if (user) tr("你") else "DSH", style = MaterialTheme.typography.labelMedium, color = if (user) Blue else Color(0xFF64748B), modifier = Modifier.padding(bottom = 8.dp))
-                            SelectionContainer { Text(message.string("text"), style = MaterialTheme.typography.bodyLarge) }
-                        }
-                    }
-                }
-            }
+            items(timeline, key = { it.seq }) { item -> TimelineRow(item) }
             if (running) item { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text(tr("DSH 正在工作…"), modifier = Modifier.padding(start = 10.dp), color = Color(0xFF64748B)) } }
             if (chat.string("error").isNotBlank()) item { Text(chat.string("error"), color = MaterialTheme.colorScheme.error) }
         }
@@ -342,18 +337,26 @@ private fun FilesPane(state: PocketState, model: PocketModel, onWorkspace: () ->
         if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
         LazyColumn(Modifier.fillMaxSize()) {
             itemsIndexed(state.entries, key = { index, entry -> "${entry.path}_$index" }) { _, entry ->
-                FileRow(entry) { if (entry.directory) model.browse(entry.path) else model.openFile(entry) }
+                // Runnable files get their own run button, so the file list can
+                // start something without opening the viewer first.
+                val command = if (entry.directory) null else runCommandFor(entry.path)
+                FileRow(entry,
+                    onClick = { if (entry.directory) model.browse(entry.path) else model.openFile(entry) },
+                    onRun = command?.let { run -> { onTerminal(entry.path.substringBeforeLast('/'), run) } })
             }
         }
     }
 }
 
 @Composable
-private fun FileRow(entry: FileEntry, onClick: () -> Unit) {
+private fun FileRow(entry: FileEntry, onClick: () -> Unit, onRun: (() -> Unit)? = null) {
     ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         supportingContent = { Text(if (entry.directory) tr("文件夹") else humanSize(entry.size), style = MaterialTheme.typography.labelSmall) },
         leadingContent = { Icon(if (entry.directory) Icons.Outlined.Folder else fileIcon(entry.name), null,
             tint = if (entry.directory) Blue else Color(0xFF64748B)) },
+        trailingContent = onRun?.let { action -> {
+            IconButton(onClick = action) { Icon(Icons.Outlined.PlayArrow, tr("在终端运行"), tint = Blue) }
+        } },
         modifier = Modifier.clickable(onClick = onClick),
         colors = ListItemDefaults.colors(containerColor = Color.Transparent))
 }
@@ -413,7 +416,7 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
             if (state.browserTruncated) Text(tr("条目过多，仅显示前一部分。"), style = MaterialTheme.typography.bodySmall)
             LazyColumn(Modifier.height(180.dp)) {
                 itemsIndexed(state.entries.filter { it.directory }, key = { index, entry -> "${entry.path}_$index" }) { _, entry ->
-                    FileRow(entry) { model.browse(entry.path, true) }
+                    FileRow(entry, onClick = { model.browse(entry.path, true) })
                 }
             }
             TextButton(onClick = { create = true }, enabled = path.isNotBlank()) {

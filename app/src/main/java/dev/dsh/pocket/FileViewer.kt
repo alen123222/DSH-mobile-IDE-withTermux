@@ -205,7 +205,7 @@ fun FileViewerScreen(open: OpenFile, model: PocketModel, onClose: () -> Unit,
                      onTerminal: (String, String?) -> Unit) {
     val context = LocalContext.current
     val syntax = remember(open.language, open.name) { syntaxFor(open.language, open.name) }
-    val runner = remember(open.name) { runnerFor(open.name) }
+    val command = remember(open.path) { runCommandFor(open.path) }
     var value by remember(open.path) { mutableStateOf(TextFieldValue(open.text)) }
     var editing by remember(open.path) { mutableStateOf(open.editable && !open.isGbk) }
     var saving by remember(open.path) { mutableStateOf(false) }
@@ -253,8 +253,8 @@ fun FileViewerScreen(open: OpenFile, model: PocketModel, onClose: () -> Unit,
                     Icon(Icons.Outlined.Save, tr("保存"))
                 }
                 // Run: jump to the terminal in this file's folder and start it.
-                if (open.isText && runner != null) IconButton(onClick = {
-                    onTerminal(open.path.substringBeforeLast('/'), runner + " " + shellQuote(open.path))
+                if (open.isText && command != null) IconButton(onClick = {
+                    onTerminal(open.path.substringBeforeLast('/'), command)
                 }) { Icon(Icons.Outlined.PlayArrow, tr("在终端运行")) }
                 IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, tr("更多")) }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -326,16 +326,36 @@ fun FileViewerScreen(open: OpenFile, model: PocketModel, onClose: () -> Unit,
         dismissButton = { TextButton(onClick = { confirmClose = false }) { Text(tr("继续编辑")) } })
 }
 
-/** The interpreter Termux should use, or null when running the file is not ours to guess. */
-fun runnerFor(name: String): String? = when (name.substringAfterLast('.', "").lowercase()) {
-    "py", "pyw" -> "python3"
-    "sh", "bash" -> "bash"
-    "js", "mjs", "cjs" -> "node"
-    "rb" -> "ruby"
-    "php" -> "php"
-    "lua" -> "lua"
-    "pl" -> "perl"
-    else -> null
+/**
+ * The shell command that runs this file, or null when we have no business
+ * guessing. Interpreted languages run directly; compiled ones are built into a
+ * sibling artefact first, which fails loudly in the terminal when no toolchain
+ * is installed instead of silently doing nothing.
+ */
+fun runCommandFor(path: String): String? {
+    val name = path.substringAfterLast('/')
+    val base = name.substringBeforeLast('.', name)
+    val quoted = shellQuote(path)
+    val output = shellQuote(base + ".out")
+    return when (name.substringAfterLast('.', "").lowercase()) {
+        "py", "pyw" -> "python3 " + quoted
+        "sh", "bash" -> "bash " + quoted
+        "js", "mjs", "cjs" -> "node " + quoted
+        "rb" -> "ruby " + quoted
+        "php" -> "php " + quoted
+        "lua" -> "lua " + quoted
+        "pl" -> "perl " + quoted
+        "ts" -> "npx --yes tsx " + quoted
+        "java" -> "java " + quoted
+        "kt", "kts" -> "kotlinc " + quoted + " -include-runtime -d " + shellQuote(base + ".jar") + " && java -jar " + shellQuote(base + ".jar")
+        "c" -> "cc " + quoted + " -o " + output + " && " + output
+        "cpp", "cc", "cxx" -> "c++ " + quoted + " -o " + output + " && " + output
+        "go" -> "go run " + quoted
+        "rs" -> "rustc " + quoted + " -o " + output + " && " + output
+        "swift" -> "swift " + quoted
+        "dart" -> "dart run " + quoted
+        else -> null
+    }
 }
 
 @Composable
