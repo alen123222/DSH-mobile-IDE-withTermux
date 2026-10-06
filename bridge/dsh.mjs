@@ -318,7 +318,12 @@ export class DshSessions {
     text(body.model, t('模型名称'), 200);
     const settings = connectionSettings(body);
     if (!settings.apiKey && !this.options.command) throw new ApiError(400, t('请在环境页保存 API Key'));
-    if (item.process && item.connectionSignature !== connectionSignature(settings)) throw new ApiError(409, t('API 连接或模型已更改，请新建会话使设置生效'));
+    // A process holds one model for its whole life and reads its API patch at
+    // startup, so a changed connection needs a fresh one. Reaching this line means
+    // the chat is idle (the status check above admits only 'ready'), so retiring
+    // the old process is invisible: the transcript stays, and the replacement
+    // resumes the same engine session.
+    if (item.process && item.connectionSignature !== connectionSignature(settings)) this.terminate(item);
     if (!this.dshBin()) throw new ApiError(409, t('尚未安装 DSH，请先在环境页安装引擎'));
     item.status = 'running';
     item.error = undefined;

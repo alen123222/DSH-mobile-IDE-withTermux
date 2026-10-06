@@ -83,6 +83,20 @@ test('the file API classifies text, keeps binary viewable and refuses escapes', 
   assert.equal((await request('directories', { method: 'POST', body: { parent: projects[0], name: '../escape' } })).status, 400);
 });
 
+test('changing the model on an idle chat continues it in place', async t => {
+  const { request, projects } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'first', model: 'test', allowExecution: true } });
+  await waitChat(request, chat.id, c => c.status === 'ready');
+  // Nothing is running, so a different model must replace the idle process
+  // instead of demanding a brand new chat.
+  const response = await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'second', model: 'other-model', allowExecution: true } });
+  assert.equal(response.status, 200);
+  const result = await waitChat(request, chat.id, c => c.status === 'ready');
+  assert.match(result.messages.at(-1).text, /second$/);
+});
+
 test('the transcript is ordered and tool arguments are stored as text', async t => {
   const { request, projects, bridge } = await setup(t);
   const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
@@ -148,9 +162,13 @@ test('DSH protocol handles receipt races, isolates cwd, and continues live conve
   const complete = await waitChat(request, id, value => value.status !== 'running');
   assert.equal(complete.messages.length, 4);
   assert.match(complete.messages.at(-1).text, /second turn$/);
-  const changed = await request(`chats/${id}/prompt`, { method: 'POST', body: { ...payload, prompt: 'wrong credentials', apiKey: 'other-key' } });
-  assert.equal(changed.status, 409);
-  assert.match(changed.body.error, /新建会话/);
+  // Changing the connection while nothing is running replaces the idle process
+  // and continues the same chat, instead of demanding a brand new one.
+  const changed = await request(`chats/${id}/prompt`, { method: 'POST', body: { ...payload, prompt: 'new credentials', apiKey: 'other-key' } });
+  assert.equal(changed.status, 200);
+  const swapped = await waitChat(request, id, value => value.status !== 'running');
+  assert.equal(swapped.status, 'ready', swapped.error);
+  assert.match(swapped.messages.at(-1).text, /new credentials$/);
 });
 
 test('stop terminates the owned runtime, preserves the transcript and allows resuming', async t => {

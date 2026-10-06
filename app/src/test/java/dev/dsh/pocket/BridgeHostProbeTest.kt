@@ -11,7 +11,7 @@ class BridgeHostProbeTest {
     @Test fun `real health probe and diagnostic report use controlled local server`() {
         MockWebServer().use { server ->
             server.start()
-            repeat(3) { server.enqueue(MockResponse().setBody("{\"version\":\"0.4.4\"}")) }
+            repeat(3) { server.enqueue(MockResponse().setBody("{\"version\":\"0.4.5\"}")) }
             val api = BridgeApi("synthetic-test-token", server.port)
             assertEquals("127.0.0.1", api.probeHosts())
             val report = api.probeReport()

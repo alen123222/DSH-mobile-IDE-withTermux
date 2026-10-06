@@ -225,6 +225,7 @@ object Lang {
         "移除" to "Remove",
         "已保存" to "Saved",
         "已保存并启用；请在新会话中使用。" to "Saved and activated; use it in a new chat.",
+        "已保存并启用；下一条消息生效。" to "Saved and activated; it applies from the next message.",
         "已被外部修改" to "changed elsewhere",
         "已发现 DSH · SDK 模式" to "DSH found · SDK mode",
         "用其他应用打开" to "Open with another app",

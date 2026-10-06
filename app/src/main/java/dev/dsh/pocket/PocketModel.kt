@@ -67,7 +67,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             val items = state.value.presets.filterNot { it.id == preset.id } + preset
             secrets.savePresets(preset.id, items)
             invalidateApiCheck()
-            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = tr("已保存并启用；请在新会话中使用。")) }
+            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = tr("已保存并启用；下一条消息生效。")) }
         } catch (e: Exception) { error(e.message ?: tr("保存失败")) }
     }
     fun selectPreset(id: String) {
