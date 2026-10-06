@@ -10,6 +10,27 @@ import { t } from './i18n.mjs';
 // Matches DSH 0.2.0-rc.2's SDK protocol. Every process has one immutable cwd.
 // The SDK has no approval-response or cancel method; execution consent is
 // explicit before launch, and Stop terminates this session's owned process.
+const clip = (value, limit) => (typeof value === 'string' && value.length > limit ? value.slice(0, limit) + '…' : value);
+function resultText(data) {
+  const content = data?.message?.content;
+  if (!Array.isArray(content)) return '';
+  return content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
+}
+/** Store the shape the transcript needs, not the raw engine payload. */
+function summarizeEvent(event) {
+  const data = event.data || {};
+  if (event.type === 'tool/call') {
+    return { turn: data.turn, step: data.step, callId: data.callId, name: data.name,
+      arguments: clip(typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments || {}), 4000) };
+  }
+  if (event.type === 'tool/result') {
+    return { turn: data.turn, step: data.step, callId: data.toolCallId || data.message?.toolCallId,
+      text: clip(resultText(data), 4000), error: Boolean(data.message?.error || data.error) };
+  }
+  if (event.type === 'turn/end') return { turn: data.turn, reason: data.reason };
+  return { turn: data.turn, note: clip(JSON.stringify(data), 1000) };
+}
+
 export class DshSessions {
   constructor(stateDir, options = {}) {
     this.stateDir = stateDir;
@@ -21,9 +42,23 @@ export class DshSessions {
     for (const name of fs.readdirSync(dir).filter(n => n.endsWith('.json'))) {
       const data = readJson(path.join(dir, name));
       if (!data?.id) continue;
-      this.sessions.set(data.id, { ...data, status: 'archived', starred: data.starred === true,
-        process: null, pending: new Map(), listeners: new Set(), generation: 0, runId: 0, requestId: 0, disposed: false });
+      const item = { ...data, status: 'archived', starred: data.starred === true,
+        process: null, pending: new Map(), listeners: new Set(), generation: 0, runId: 0, requestId: 0, disposed: false };
+      this.sequence(item);
+      this.sessions.set(data.id, item);
     }
+  }
+  /**
+   * The client renders messages and tool events as one ordered transcript, so
+   * every entry carries a monotonic sequence. Records written before this
+   * existed are backfilled once, by time, so an upgrade cannot scramble an old
+   * conversation.
+   */
+  sequence(item) {
+    if (!Number.isInteger(item.seq)) item.seq = 0;
+    const entries = [...(item.messages || []), ...(item.events || [])];
+    if (entries.every(entry => Number.isInteger(entry.seq))) return;
+    for (const entry of entries.sort((a, b) => (a.time || 0) - (b.time || 0))) entry.seq = ++item.seq;
   }
   dshBin() {
     return this.options.dshBin || (fs.existsSync(path.join(this.stateDir, 'runtime', '.pocket-ready'))
@@ -31,7 +66,7 @@ export class DshSessions {
   }
   create(workspace) {
     const item = { id: `pocket-${crypto.randomUUID()}`, workspaceId: workspace.id, cwd: workspace.path,
-      title: t('新会话'), messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
+      title: t('新会话'), messages: [], events: [], seq: 0, status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
       pending: new Map(), listeners: new Set(), process: null, generation: 0, runId: 0, requestId: 0, disposed: false };
     this.sessions.set(item.id, item);
     this.save(item);
@@ -244,15 +279,23 @@ export class DshSessions {
         if (!Array.isArray(content)) throw new Error(t('无效的助手消息'));
         const value = content.filter(c => c.type === 'text').map(c => c.text).join('');
         if (value) {
-          item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now() });
+          item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now(), seq: ++item.seq });
           // messages had no ceiling at all; a long run grew the snapshot (and every
           // flush) without bound. Keep the tail, which is what the user reads.
           const limit = this.options.maxMessages ?? 500;
           if (item.messages.length > limit) item.messages.splice(0, item.messages.length - limit);
         }
+        // Reasoning rides along as a non-text part on the same message. Its exact
+        // type varies by model, so keep any textual part that is not plain text
+        // and looks like reasoning, and show it as the Thinking block.
+        const thinking = content
+          .filter(c => typeof c.text === 'string' && c.type !== 'text' && /think|reason/i.test(String(c.type)))
+          .map(c => c.text).join('\n').trim();
+        if (thinking) item.events.push({ type: 'assistant/thinking', data: { text: clip(thinking, 8000) },
+          time: Date.now(), seq: ++item.seq });
       }
       if (['tool/call', 'tool/result', 'turn/end', 'assistant/attempt'].includes(event.type)) {
-        item.events.push({ type: event.type, data: event.data, time: Date.now() });
+        item.events.push({ type: event.type, data: summarizeEvent(event), time: Date.now(), seq: ++item.seq });
         if (item.events.length > (this.options.maxEvents ?? 300)) item.events.shift();
         if (event.type === 'turn/end' && event.data?.reason?.kind === 'error') item.error = this.redact(item, JSON.stringify(event.data.reason));
       }
@@ -282,7 +325,7 @@ export class DshSessions {
     item.receipt = null;
     item.consumed = false;
     item.notificationBuffer = [];
-    item.messages.push({ id: crypto.randomUUID(), role: 'user', text: body.prompt, time: Date.now() });
+    item.messages.push({ id: crypto.randomUUID(), role: 'user', text: body.prompt, time: Date.now(), seq: ++item.seq });
     if (item.title === t('新会话')) item.title = body.prompt.slice(0, 40);
     this.touch(item);
     this.flush(item);

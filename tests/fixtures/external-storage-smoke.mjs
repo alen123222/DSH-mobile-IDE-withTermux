@@ -15,7 +15,7 @@ async function request(route, method = 'GET', body) {
   return data;
 }
 const health = await request('health');
-if (health.version !== '0.4.3') throw new Error('Update the local service first');
+if (health.version !== '0.4.4') throw new Error('Update the local service first');
 const shortcuts = await request(`shortcuts?external=${encodeURIComponent(volume)}`);
 if (!shortcuts.items.some(x => x.path === volume)) throw new Error('External mount shortcut missing');
 console.log(JSON.stringify({ stage: 'discovery', external: shortcuts.items.filter(x => x.path === volume || /external-\d+$/.test(x.path)) }));

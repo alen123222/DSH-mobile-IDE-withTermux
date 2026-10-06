@@ -83,6 +83,24 @@ test('the file API classifies text, keeps binary viewable and refuses escapes', 
   assert.equal((await request('directories', { method: 'POST', body: { parent: projects[0], name: '../escape' } })).status, 400);
 });
 
+test('the transcript is ordered and tool arguments are stored as text', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'go', model: 'test', allowExecution: true } });
+  await waitChat(request, chat.id, c => c.status === 'ready');
+  const item = bridge.chats.get(chat.id);
+  const entries = [...item.messages, ...item.events];
+  assert.ok(entries.length >= 2, 'the turn produced entries');
+  assert.ok(entries.every(e => Number.isInteger(e.seq) && e.seq > 0), 'every entry carries a sequence');
+  assert.equal(new Set(entries.map(e => e.seq)).size, entries.length, 'sequences are unique');
+  const call = item.events.find(e => e.type === 'tool/call');
+  assert.ok(call, 'the tool call was recorded');
+  assert.equal(typeof call.data.name, 'string');
+  assert.equal(typeof call.data.arguments, 'string', 'arguments are normalised to text for the UI');
+  assert.ok(item.events.some(e => e.type === 'turn/end'));
+});
+
 test('bridge messages follow the Accept-Language header', async t => {
   const { base, token } = await setup(t);
   const error = async language => {
