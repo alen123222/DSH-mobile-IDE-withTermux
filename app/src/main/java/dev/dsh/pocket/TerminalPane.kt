@@ -56,7 +56,7 @@ fun TerminalPane(id: String, api: BridgeApi, onError: (String) -> Unit, onClose:
         for (message in messages) {
             try { withContext(Dispatchers.IO) { api.call("terminals/$id", "POST", message) } }
             catch (e: CancellationException) { throw e }
-            catch (e: Exception) { onError(e.message ?: "终端输入失败") }
+            catch (e: Exception) { onError(e.message ?: tr("终端输入失败")) }
         }
     }
     LaunchedEffect(id, ready) {
@@ -65,19 +65,19 @@ fun TerminalPane(id: String, api: BridgeApi, onError: (String) -> Unit, onClose:
         while (true) {
             try {
                 val result = withContext(Dispatchers.IO) { api.call("terminals/$id", query = mapOf("after" to cursor.toString())) }
-                if (result.optBoolean("gap")) webView?.evaluateJavascript("window.terminalNotice('部分旧输出已滚出缓存；可按 Ctrl+L 重绘')", null)
+                if (result.optBoolean("gap")) webView?.evaluateJavascript("window.terminalNotice('" + tr("部分旧输出已滚出缓存；可按 Ctrl+L 重绘") + "')", null)
                 for (chunk in result.objects("chunks")) {
                     webView?.evaluateJavascript("window.receiveBase64(${JSONObject.quote(chunk.getString("data"))})", null)
                 }
                 cursor = result.getLong("cursor")
                 if (!result.optBoolean("running")) {
                     exited = true
-                    webView?.evaluateJavascript("window.terminalNotice('终端已退出')", null)
+                    webView?.evaluateJavascript("window.terminalNotice('" + tr("终端已退出") + "')", null)
                     break
                 }
                 delay(200)
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { onError(e.message ?: "终端连接已断开"); break }
+            catch (e: Exception) { onError(e.message ?: tr("终端连接已断开")); break }
         }
     }
     DisposableEffect(id) {
@@ -86,7 +86,7 @@ fun TerminalPane(id: String, api: BridgeApi, onError: (String) -> Unit, onClose:
     Column(modifier.background(Color(0xFF111827))) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("BASH  ·  TERMUX", style = MaterialTheme.typography.labelMedium, color = Color(0xFF94A3B8), modifier = Modifier.padding(top = 14.dp))
-            TextButton(onClick = onClose) { Text(if (exited) "重新打开" else "结束终端", color = Color(0xFFCBD5E1)) }
+            TextButton(onClick = onClose) { Text(if (exited) tr("重新打开") else tr("结束终端"), color = Color(0xFFCBD5E1)) }
         }
         AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { context ->
             WebView(context).apply {

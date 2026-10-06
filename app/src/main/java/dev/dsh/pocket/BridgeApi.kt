@@ -16,7 +16,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.3.8"
+const val BRIDGE_VERSION = "0.4.3"
 
 /**
  * Never route through a proxy. The bridge only listens on this device's own
@@ -28,20 +28,24 @@ internal val NO_PROXY: ProxySelector = object : ProxySelector() {
     override fun connectFailed(uri: URI?, sa: SocketAddress?, io: IOException?) = Unit
 }
 
-class BridgeApi(internal val token: String) {
+class BridgeApi @JvmOverloads constructor(internal val token: String, internal val port: Int = BuildConfig.BRIDGE_PORT) {
     // A VPN or a per-app proxy can capture an app's traffic while leaving Termux
     // alone, which sends the app's 127.0.0.1 somewhere other than the device's
     // own loopback interface. Termux then reports a perfectly healthy service
     // that the app can never reach. Probe the plausible local addresses once and
     // remember whichever answers, rather than trusting loopback blindly.
     @Volatile internal var host: String = "127.0.0.1"
-    internal val candidates = listOf("127.0.0.1", "localhost", "10.0.2.2")
+    internal val candidates = listOf("127.0.0.1", "localhost")
+
+    /** The bridge localises its own messages from this header. */
+    internal fun language(): String = java.util.Locale.getDefault().language
 
     /** Address currently in use; surfaced in the UI so a workaround is visible. */
     fun address(): String = host
 
     /** Remember a host that answered, so later calls skip the failing ones. */
     internal fun preferHost(candidate: String) {
+        require(candidate in candidates) { tr("本地服务只能使用本机回环地址") }
         if (candidate != host) host = candidate
     }
 
@@ -58,8 +62,8 @@ class BridgeApi(internal val token: String) {
         .readTimeout(45, TimeUnit.SECONDS).callTimeout(60, TimeUnit.SECONDS)
         .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
     // A separate client: the SSE channel must never inherit the 12 s read timeout.
-    internal val streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS).retryOnConnectionFailure(true)
+    internal var streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS).retryOnConnectionFailure(true)
         .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
 
     internal fun decode(response: Response): JSONObject = decodeText(response.body?.string().orEmpty(), response.code)
@@ -77,24 +81,24 @@ class BridgeApi(internal val token: String) {
         val configured = runCatching {
             ProxySelector.getDefault()?.select(URI("http://127.0.0.1:8765/v1/health"))
                 ?.joinToString(", ") { it.toString() }.orEmpty()
-        }.getOrElse { "查询失败: ${it.message}" }
-        report.appendLine("系统默认代理: ${configured.ifBlank { "(未设置)" }}")
-        report.appendLine("本应用强制: $NO_PROXY  (即永远直连)")
-        report.appendLine("密钥长度: ${token.length}")
+        }.getOrElse { tr("查询失败: ") + it.message }
+        report.appendLine(tr("系统默认代理: ") + configured.ifBlank { tr("(未设置)") })
+        report.appendLine(tr("本应用强制: ") + NO_PROXY + tr("  (即永远直连)"))
+        report.appendLine(tr("密钥长度: ") + token.length)
         for (candidate in candidates) {
-            report.appendLine("--- $candidate:8765 ---")
-            val request = Request.Builder().url("http://$candidate:8765/v1/health")
-                .header("Authorization", "Bearer $token").build()
+            report.appendLine("--- $candidate:$port ---")
+            val request = Request.Builder().url("http://$candidate:$port/v1/health")
+                .header("Authorization", "Bearer $token").header("Accept-Language", language()).build()
             try {
                 client.newCall(request).execute().use { response ->
-                    val body = response.body?.string().orEmpty()
+                    val body = response.peekBody(512).string()
                     report.appendLine("HTTP ${response.code} ${response.message}")
                     report.appendLine("Content-Type: ${response.header("Content-Type")}")
                     report.appendLine("Server: ${response.header("Server")}")
                     report.appendLine("body[:180]: ${body.take(180).replace("\n", " ")}")
                 }
             } catch (error: Throwable) {
-                report.appendLine("异常 ${error.javaClass.simpleName}: ${error.message}")
+                report.appendLine(tr("异常 ") + error.javaClass.simpleName + ": " + error.message)
             }
         }
         return report.toString()
@@ -119,16 +123,38 @@ class BridgeApi(internal val token: String) {
 
     /** Try one call against a specific host without disturbing the preferred one. */
     fun callOn(target: String, route: String): JSONObject {
-        val url = "http://$target:8765/v1/$route".toHttpUrl()
-        val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
+        require(target in candidates)
+        val url = "http://$target:$port/v1/$route".toHttpUrl()
+        val request = Request.Builder().url(url).header("Authorization", "Bearer $token").header("Accept-Language", language()).build()
         client.newCall(request).execute().use { response -> return decode(response) }
+    }
+
+    /**
+     * Stream one file to disk. Photos and PDFs must never travel inside JSON:
+     * base64 costs a third more bytes and holds the whole file in memory twice.
+     */
+    fun download(route: String, query: Map<String, String>, target: java.io.File) {
+        val url = "http://$host:$port/v1/$route".toHttpUrl().newBuilder()
+        query.forEach { (key, value) -> url.addQueryParameter(key, value) }
+        val request = Request.Builder().url(url.build()).header("Authorization", "Bearer $token").header("Accept-Language", language()).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                val body = response.body?.string().orEmpty()
+                val message = runCatching { JSONObject(body).optString("error") }.getOrNull()
+                throw IllegalStateException(message?.takeIf { it.isNotBlank() }
+                    ?: (tr("下载失败 (HTTP ") + response.code + ")"))
+            }
+            target.parentFile?.mkdirs()
+            val input = response.body?.byteStream() ?: throw IllegalStateException(tr("响应内容为空"))
+            input.use { source -> target.outputStream().use { sink -> source.copyTo(sink) } }
+        }
     }
 
     fun call(route: String, method: String = "GET", body: JSONObject? = null,
              query: Map<String, String> = emptyMap()): JSONObject {
-        val url = "http://$host:8765/v1/$route".toHttpUrl().newBuilder()
+        val url = "http://$host:$port/v1/$route".toHttpUrl().newBuilder()
         query.forEach { (key, value) -> url.addQueryParameter(key, value) }
-        val request = Request.Builder().url(url.build()).header("Authorization", "Bearer $token")
+        val request = Request.Builder().url(url.build()).header("Authorization", "Bearer $token").header("Accept-Language", language())
         when (method) {
             "POST" -> request.post((body ?: JSONObject()).toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             "DELETE" -> request.delete()
@@ -151,15 +177,15 @@ data class StreamFrame(val chat: JSONObject?, val deleted: Boolean)
 fun decodeText(text: String, code: Int): JSONObject {
     if (text.trimStart().startsWith("<")) {
         throw IllegalStateException(
-            "收到 HTML 而非 JSON（HTTP $code），请求未到达本地服务。" +
-            "通常是系统代理 / Wi-Fi 手动代理接管了 127.0.0.1:8765；" +
-            "请到 设置 → WLAN → 当前网络 → 高级 → 代理，改为「无」。"
+            tr("收到 HTML 而非 JSON（HTTP ") + code + tr("），请求未到达本地服务。") +
+            tr("通常是系统代理 / Wi-Fi 手动代理接管了 127.0.0.1:8765；") +
+            tr("请到 设置 → WLAN → 当前网络 → 高级 → 代理，改为「无」。")
         )
     }
     val result = runCatching { JSONObject(text) }.getOrElse {
-        throw IllegalStateException("响应不是有效 JSON（HTTP $code）: ${text.take(120)}")
+        throw IllegalStateException(tr("响应不是有效 JSON（HTTP ") + code + tr("）: ") + text.take(120))
     }
-    if (code !in 200..299) throw IllegalStateException(result.optString("error", "连接失败 ($code)"))
+    if (code !in 200..299) throw IllegalStateException(result.optString("error", tr("连接失败 (") + code + ")"))
     return result
 }
 
@@ -169,12 +195,12 @@ fun describe(error: Throwable): String {
     val detail = error.message.orEmpty()
     return when {
         detail.contains("Failed to connect", true) || detail.contains("ECONNREFUSED", true) ->
-            "端口 8765 无监听，Termux 服务未运行"
+            tr("端口 8765 无监听，Termux 服务未运行")
         detail.contains("timeout", true) || detail.contains("SocketTimeout", true) ->
-            "连接超时，Termux 可能已被系统杀死"
-        detail.contains("CLEARTEXT", true) -> "明文 HTTP 被系统策略拦截"
-        detail.contains("HTML", true) -> "请求被代理接管（收到 HTML 而非本地服务的 JSON）"
-        detail.contains("401", true) || detail.contains("密钥", true) -> "配对密钥不匹配"
+            tr("连接超时，Termux 可能已被系统杀死")
+        detail.contains("CLEARTEXT", true) -> tr("明文 HTTP 被系统策略拦截")
+        detail.contains("HTML", true) -> tr("请求被代理接管（收到 HTML 而非本地服务的 JSON）")
+        detail.contains("401", true) || detail.contains(tr("密钥"), true) -> tr("配对密钥不匹配")
         detail.isBlank() -> type
         else -> "$type: $detail"
     }
@@ -182,8 +208,8 @@ fun describe(error: Throwable): String {
 
 /** One SSE channel. Returns the Call so the caller can cancel it. */
 fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () -> Unit): Call {
-    val url = "http://$host:8765/v1/chats/$id/stream".toHttpUrl()
-    val request = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
+    val url = "http://$host:$port/v1/chats/$id/stream".toHttpUrl()
+    val request = Request.Builder().url(url).header("Authorization", "Bearer $token").header("Accept-Language", language()).build()
     val call = streamClient.newCall(request)
     call.enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) { onClosed() }
@@ -191,10 +217,11 @@ fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () ->
             // Every exit path must reach onClosed, otherwise a read error leaves
             // the caller waiting forever and the UI silently stops updating.
             try {
-                if (!response.isSuccessful) { onClosed(); return }
+                response.use {
+                if (!response.isSuccessful) return
                 val type = response.header("Content-Type").orEmpty()
-                if (!type.contains("text/event-stream")) { onClosed(); return }
-                val source = response.body?.source() ?: run { onClosed(); return }
+                if (!type.contains("text/event-stream")) return
+                val source = response.body?.source() ?: return
                 var event = "message"
                 while (!source.exhausted()) {
                     val line = source.readUtf8LineStrict()
@@ -208,6 +235,7 @@ fun BridgeApi.stream(id: String, onFrame: (StreamFrame) -> Unit, onClosed: () ->
                         }
                         line.isBlank() -> event = "message"
                     }
+                }
                 }
             } catch (e: IOException) {
                 // Normal when the radio drops or the service is restarted.

@@ -8,10 +8,13 @@ android {
     compileSdk = 35
     defaultConfig {
         applicationId = "dev.dsh.pocket"
+        manifestPlaceholders["pocketLabel"] = "DSH Pocket"
+        buildConfigField("int", "BRIDGE_PORT", "8765")
+        buildConfigField("String", "STATE_DIRECTORY", "\"dsh-pocket\"")
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.3.6-dev"
+        versionCode = 13
+        versionName = "0.4.3-dev"
         testInstrumentationRunner = "dev.dsh.pocket.ProviderSmokeInstrumentation"
     }
     buildFeatures { compose = true; buildConfig = true }
@@ -31,6 +34,7 @@ val bridgeAssets by tasks.registering(Copy::class) {
 tasks.named("preBuild") { dependsOn(bridgeAssets) }
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     // The android.jar used for unit tests stubs org.json, so decodeText would
     // throw "not mocked" instead of the behaviour under test.
     testImplementation("org.json:json:20240303")

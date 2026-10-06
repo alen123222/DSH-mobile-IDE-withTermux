@@ -49,7 +49,7 @@ class Secrets(context: Context) {
             val items = json.objects("items").map { ApiPreset(it.getString("id"), it.getString("name"), EngineSettings.from(it.getJSONObject("settings"))) }
             if (items.isNotEmpty()) return json.string("activeId", items.first().id) to items
         }
-        val item = ApiPreset(UUID.randomUUID().toString(), "原有连接", EngineSettings.from(JSONObject(read("engine") ?: "{}")))
+        val item = ApiPreset(UUID.randomUUID().toString(), tr("原有连接"), EngineSettings.from(JSONObject(read("engine") ?: "{}")))
         savePresets(item.id, listOf(item))
         return item.id to listOf(item)
     }

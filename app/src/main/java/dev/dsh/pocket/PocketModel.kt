@@ -1,6 +1,8 @@
 package dev.dsh.pocket
 
 import android.app.Application
+import android.os.Build
+import android.os.storage.StorageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +21,7 @@ import org.json.JSONObject
 import java.util.UUID
 
 /** A well-known starting point, with whether this Termux can actually read it. */
-data class Shortcut(val label: String, val path: String, val available: Boolean)
+data class Shortcut(val label: String, val path: String, val available: Boolean, val reason: String = "")
 
 data class PocketState(
     val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
@@ -27,7 +29,7 @@ data class PocketState(
     val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
     val shortcuts: List<Shortcut> = emptyList(), val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
-    val settings: EngineSettings = EngineSettings(), val error: String? = null, val preview: JSONObject? = null,
+    val settings: EngineSettings = EngineSettings(), val error: String? = null, val viewer: OpenFile? = null,
     val consent: Boolean = false, val terminalId: String? = null,
     val presets: List<ApiPreset> = emptyList(), val activePresetId: String = "",
     val apiChecking: Boolean = false, val apiModels: List<String> = emptyList(), val apiResult: String = "",
@@ -44,7 +46,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     private var monitor: Job? = null
     private var streamCall: Call? = null
     private var streaming: String? = null
-    private val streamEnded = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private var monitorRevision = 0
     private var connecting: Job? = null
     private var selectionRevision = 0
     private var browserRevision = 0
@@ -60,13 +62,13 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     fun savePreset(id: String?, name: String, settings: EngineSettings) {
         try {
             ProviderEndpoint.base(settings)
-            require(name.isNotBlank() && settings.model.isNotBlank()) { "请填写预设名称和模型 ID" }
+            require(name.isNotBlank() && settings.model.isNotBlank()) { tr("请填写预设名称和模型 ID") }
             val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route))
             val items = state.value.presets.filterNot { it.id == preset.id } + preset
             secrets.savePresets(preset.id, items)
             invalidateApiCheck()
-            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = "已保存并启用；请在新会话中使用。") }
-        } catch (e: Exception) { error(e.message ?: "保存失败") }
+            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = tr("已保存并启用；请在新会话中使用。")) }
+        } catch (e: Exception) { error(e.message ?: tr("保存失败")) }
     }
     fun selectPreset(id: String) {
         val preset = state.value.presets.firstOrNull { it.id == id } ?: return
@@ -76,7 +78,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     }
     fun deletePreset(id: String) {
         val items = state.value.presets.filterNot { it.id == id }
-        if (items.isEmpty()) { error("请至少保留一个预设"); return }
+        if (items.isEmpty()) { error(tr("请至少保留一个预设")); return }
         val active = items.firstOrNull { it.id == state.value.activePresetId } ?: items.first()
         secrets.savePresets(active.id, items)
         invalidateApiCheck()
@@ -90,18 +92,18 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     fun checkApi(settings: EngineSettings, listModels: Boolean) {
         val revision = ++apiRevision
         apiCheck?.cancel()
-        mutable.update { it.copy(apiChecking = true, apiResult = if (listModels) "正在查询模型…" else "正在发送简短测试请求…", apiModels = emptyList()) }
+        mutable.update { it.copy(apiChecking = true, apiResult = if (listModels) tr("正在查询模型…") else tr("正在发送简短测试请求…"), apiModels = emptyList()) }
         apiCheck = viewModelScope.launch {
             try {
                 if (listModels) {
                     val models = withContext(Dispatchers.IO) { providerClient.models(settings) }
-                    if (revision == apiRevision) mutable.update { it.copy(apiModels = models, apiResult = "发现 ${models.size} 个模型。列表不代表每个模型均可调用，请选择后测试。") }
+                    if (revision == apiRevision) mutable.update { it.copy(apiModels = models, apiResult = tr("发现 ") + models.size + tr(" 个模型。列表不代表每个模型均可调用，请选择后测试。")) }
                 } else {
                     val result = withContext(Dispatchers.IO) { providerClient.test(settings) }
                     if (revision == apiRevision) mutable.update { it.copy(apiResult = result) }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (revision == apiRevision) mutable.update { it.copy(apiResult = (e.message ?: "测试失败").let { message -> if (settings.apiKey.isNotEmpty()) message.replace(settings.apiKey, "[已隐藏]") else message }) } }
+            catch (e: Exception) { if (revision == apiRevision) mutable.update { it.copy(apiResult = (e.message ?: tr("测试失败")).let { message -> if (settings.apiKey.isNotEmpty()) message.replace(settings.apiKey, tr("[已隐藏]")) else message }) } }
             finally { if (revision == apiRevision) mutable.update { it.copy(apiChecking = false) } }
         }
     }
@@ -122,7 +124,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             mutable.update { it.copy(connecting = true) }
             // Keep the real reason. "服务未连接" on its own made a healthy
             // service look broken when the real fault was elsewhere.
-            var lastFailure = "尚未尝试连接"
+            var lastFailure = tr("尚未尝试连接")
             var failure = { value: String -> lastFailure = value }
             try {
                 var health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
@@ -144,7 +146,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                                     api.probeHosts().also { api.preferHost(it) }
                                 }
                             }.onFailure { failure(describe(it)) }.getOrNull()
-                            if (reachable != null) health = api.call("health")
+                            if (reachable != null) health = withContext(Dispatchers.IO) { api.call("health") }
                             if (health != null) break
                         }
                     }
@@ -171,20 +173,20 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                     if (state.value.selected == null && workspaces.isNotEmpty()) select(workspaces.first())
                 } else {
                     mutable.update { it.copy(connected = false) }
-                    if (start) error("本地服务无响应（$lastFailure；已尝试 ${api.candidates.joinToString("/")}）。" +
-                        "若 Termux 显示 local service already running，说明服务在跑但 App 连不上；" +
-                        "请到 设置 → WLAN → 当前网络 → 高级 → 代理 改为「无」，或重启手机后再试。")
+                    if (start) error(tr("本地服务无响应（") + lastFailure + tr("；已尝试 ") + api.candidates.joinToString("/") + tr("）。") +
+                        tr("若 Termux 显示 local service already running，说明服务在跑但 App 连不上；") +
+                        tr("请到 设置 → WLAN → 当前网络 → 高级 → 代理 改为「无」，或重启手机后再试。"))
                 }
             } catch (e: Exception) { error(describe(e)) }
             finally { mutable.update { it.copy(connecting = false) } }
         }
     }
     private fun task(block: suspend () -> Unit) = viewModelScope.launch {
-        try { block() } catch (e: Exception) { error(e.message ?: "操作失败") }
+        try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) { error(e.message ?: tr("操作失败")) }
     }
     fun select(workspace: Workspace) {
         selectionRevision++
-        monitor?.cancel()
+        stopMonitor()
         mutable.update { it.copy(selected = workspace, chat = null, chats = emptyList(), terminalId = null, consent = false, entries = emptyList(), browserPath = workspace.path) }
         browse(workspace.path)
         val revision = selectionRevision
@@ -246,8 +248,13 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     fun loadShortcuts() = viewModelScope.launch {
         val items = runCatching {
             withContext(Dispatchers.IO) {
-                api.call("shortcuts").objects("items").map {
-                    Shortcut(it.getString("label"), it.getString("path"), it.optBoolean("available"))
+                val storage = getApplication<Application>().getSystemService(StorageManager::class.java)
+                val volumes = storage.storageVolumes.filter { it.isRemovable }.mapNotNull {
+                    if (Build.VERSION.SDK_INT >= 30) it.directory?.absolutePath
+                    else it.uuid?.let { uuid -> "/storage/$uuid" }
+                }
+                api.call("shortcuts", query = mapOf("external" to volumes.joinToString("\n"))).objects("items").map {
+                    Shortcut(it.getString("label"), it.getString("path"), it.optBoolean("available"), it.string("reason"))
                 }
             }
         }.getOrElse {
@@ -255,29 +262,81 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             // and the browse call reports the real error if there is one. An
             // empty path means "the server default", which is the same thing as
             // home for this bridge, so it is not an empty target after all.
-            listOf(Shortcut("主目录", "", true), Shortcut("内部存储", "/storage/emulated/0", true),
-                Shortcut("共享存储", "/sdcard", true), Shortcut("根目录", "/", true))
+            listOf(Shortcut(tr("主目录"), "", true), Shortcut(tr("内部存储"), "/storage/emulated/0", true))
         }
         mutable.update { it.copy(shortcuts = items) }
     }
 
-    fun addWorkspace(path: String) = task {
+    fun addWorkspace(path: String, onSuccess: () -> Unit = {}) = task {
         val workspace = withContext(Dispatchers.IO) { Workspace.from(api.call("workspaces", "POST", JSONObject().put("path", path))) }
         val all = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
         mutable.update { it.copy(workspaces = all) }
         select(workspace)
+        onSuccess()
     }
-    fun createDirectory(name: String) = task {
-        val parent = state.value.browserPath
+    fun createDirectory(name: String, parent: String = state.value.browserPath, onSuccess: () -> Unit = {}) = task {
         withContext(Dispatchers.IO) { api.call("directories", "POST", JSONObject().put("parent", parent).put("name", name)) }
-        browse(parent)
+        browse(parent, true)
+        onSuccess()
     }
-    fun preview(entry: FileEntry) = task {
+    /**
+     * Open one file. Text comes back inline; images, PDFs and archives are
+     * streamed to the app cache, because rendering them needs a real file.
+     */
+    fun openFile(entry: FileEntry) = task {
         val workspace = state.value.selected ?: return@task
-        val value = withContext(Dispatchers.IO) { api.call("file", query = mapOf("workspaceId" to workspace.id, "path" to entry.path)) }
-        mutable.update { it.copy(preview = value) }
+        val info = withContext(Dispatchers.IO) {
+            api.call("file", query = mapOf("workspaceId" to workspace.id, "path" to entry.path))
+        }
+        val kind = info.string("kind", "binary")
+        var cache: java.io.File? = null
+        if (kind != "text") {
+            val directory = java.io.File(getApplication<Application>().cacheDir, "open").apply { mkdirs() }
+            val target = java.io.File(directory, info.string("name", entry.name))
+            withContext(Dispatchers.IO) {
+                api.download("raw", mapOf("workspaceId" to workspace.id, "path" to entry.path), target)
+            }
+            cache = target
+        }
+        mutable.update { it.copy(viewer = OpenFile.from(info, cache)) }
     }
-    fun closePreview() = mutable.update { it.copy(preview = null) }
+    fun closeFile() = mutable.update { it.copy(viewer = null) }
+    /** Unpack a zip next to itself, then show the folder that now holds it. */
+    fun extractArchive(path: String, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            val workspace = state.value.selected ?: return@launch
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    api.call("extract", "POST", JSONObject().put("workspaceId", workspace.id).put("path", path))
+                }
+                val destination = result.optString("path")
+                mutable.update { it.copy(viewer = null) }
+                browse(destination.substringBeforeLast('/'))
+                onResult(true, tr("已解压 ") + result.optInt("entries") + tr(" 个文件到 ") + destination)
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { onResult(false, e.message ?: tr("解压失败")) }
+        }
+    }
+    /** Save an edit. force skips the mtime fence once the user has seen the conflict. */
+    fun saveFile(path: String, content: String, ifMtime: Long, force: Boolean, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            val workspace = state.value.selected
+            if (workspace == null) { onResult(false, tr("未选择工作区")); return@launch }
+            try {
+                val body = JSONObject().put("workspaceId", workspace.id).put("path", path).put("content", content)
+                if (!force && ifMtime > 0) body.put("ifMtime", ifMtime)
+                val saved = withContext(Dispatchers.IO) { api.call("file", "POST", body) }
+                mutable.update { current ->
+                    val viewer = current.viewer
+                    if (viewer == null || viewer.path != path) current
+                    else current.copy(viewer = viewer.copy(text = content,
+                        size = saved.optLong("size", viewer.size), mtime = saved.optLong("mtime", viewer.mtime)))
+                }
+                onResult(true, tr("已保存"))
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { onResult(false, e.message ?: tr("保存失败")) }
+        }
+    }
     fun newChat() = task {
         val workspace = state.value.selected ?: return@task
         val value = withContext(Dispatchers.IO) { api.call("chats", "POST", JSONObject().put("workspaceId", workspace.id)) }
@@ -292,80 +351,53 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(chat = value, consent = false) }
         monitor(id)
     }
-    // Live updates: prefer the SSE push channel, and keep polling as a floor.
-    // The first version stopped supervising as soon as the first frame arrived,
-    // so a stream that dropped later (screen lock, Termux restart) never
-    // reconnected and never fell back — the chat silently froze.
-    private fun monitor(id: String) {
+    private fun stopMonitor() {
+        monitorRevision++
+        streaming = null
         monitor?.cancel()
         streamCall?.cancel()
+        streamCall = null
+    }
+    override fun onCleared() {
+        stopMonitor()
+        super.onCleared()
+    }
+    private fun monitor(id: String) {
+        stopMonitor()
         streaming = id
+        val revision = monitorRevision
         monitor = viewModelScope.launch {
-            while (streaming == id) {
-                val since = mutable.value.chat?.optInt("revision", -1) ?: -1
-                val delivered = if (openStream(id)) awaitStreamEnd(id) else false
-                if (streaming != id) return@launch
-                if (delivered) {
-                    // Stream worked at least once. Reconnect promptly, but do not
-                    // spin: give the service a moment to come back.
-                    delay(1200)
-                } else {
-                    // Never got a usable stream: poll, and retry the stream later.
-                    delay(2500)
-                }
-                if (streaming != id) return@launch
-                if (delivered) continue
+            while (streaming == id && revision == monitorRevision) {
+                openStream(id, revision) // Wait for closure, not merely the first frame.
+                if (streaming != id || revision != monitorRevision) return@launch
+                delay(1200)
                 try {
+                    val since = state.value.chat?.optInt("revision", -1) ?: -1
                     val chat = withContext(Dispatchers.IO) { api.call("chats/$id", query = mapOf("since" to since.toString())) }
-                    if (streaming != id || state.value.chat?.string("id") != id) return@launch
-                    if (!chat.optBoolean("unchanged", false)) mutable.update { it.copy(chat = chat, connected = true) }
-                } catch (e: Exception) {
+                    if (streaming != id || revision != monitorRevision) return@launch
+                    mutable.update { it.copy(connected = true, chat = if (chat.optBoolean("unchanged")) it.chat else chat) }
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) {
                     mutable.update { it.copy(connected = false) }
                     delay(2000)
                 }
             }
         }
     }
-    // Returns true once the session was deleted; false when the channel closed
-    // for any other reason and should be re-established.
-    private suspend fun awaitStreamEnd(id: String): Boolean = suspendCancellableCoroutine { cont ->
-        val job = viewModelScope.launch {
-            while (streaming == id && !streamEnded.contains(id)) delay(150)
-            if (cont.isActive) cont.resume(streamEnded.remove(id)) {}
-        }
-        cont.invokeOnCancellation { job.cancel() }
-    }
-    // Resolves true once the first frame arrives (the bridge sends the current
-    // snapshot immediately on subscribe), false if the stream dies before that.
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private suspend fun openStream(id: String): Boolean = suspendCancellableCoroutine { cont ->
-        var settled = false
+    private suspend fun openStream(id: String, revision: Int): Unit = suspendCancellableCoroutine { cont ->
         val call = api.stream(id,
-            onFrame = { frame ->
-                if (streaming != id) return@stream
-                if (!settled) { settled = true; if (cont.isActive) cont.resume(true) {} }
-                when {
-                    frame.deleted -> {
-                        mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id },
-                            chat = if (it.chat?.string("id") == id) null else it.chat) }
-                        streaming = null
-                        streamEnded.add(id)
-                    }
-                    frame.chat != null -> {
-                        val chat = frame.chat
-                        mutable.update { state ->
-                            val index = state.chats.indexOfFirst { it.string("id") == id }
-                            val chats = if (index >= 0) state.chats.toMutableList().also { it[index] = chat } else state.chats
-                            state.copy(chat = if (state.chat?.string("id") == id) chat else state.chat, chats = chats, connected = true)
-                        }
-                    }
+            onFrame = { frame -> viewModelScope.launch {
+                if (streaming != id || revision != monitorRevision) return@launch
+                if (frame.deleted) {
+                    mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id }, chat = null, consent = false) }
+                    stopMonitor()
+                } else frame.chat?.let { chat ->
+                    mutable.update { state -> state.copy(chat = chat, connected = true,
+                        chats = state.chats.map { if (it.string("id") == id) chat else it }) }
                 }
-            },
+            } },
             onClosed = {
-                if (streaming != id) return@stream
-                mutable.update { it.copy(connected = false) }
-                streamEnded.add(id)
-                if (!settled) { settled = true; if (cont.isActive) cont.resume(false) {} }
+                if (cont.isActive) cont.resume(Unit)
             })
         streamCall = call
         cont.invokeOnCancellation { call.cancel() }
@@ -405,7 +437,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         mutable.update { state -> state.copy(
             chats = state.chats.filterNot { it.string("id") == id },
             chat = if (wasOpen) null else state.chat, consent = if (wasOpen) false else state.consent) }
-        if (wasOpen) streaming = null
+        if (wasOpen) stopMonitor()
     }
     fun starWorkspace(workspace: Workspace) = task {
         val value = withContext(Dispatchers.IO) {
@@ -415,38 +447,27 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             .sortedByDescending { it.starred }
         mutable.update { it.copy(workspaces = all) }
     }
-    fun deleteWorkspace(workspace: Workspace) {
-        // Optimistic: the row leaves the list immediately, and comes back only if
-        // the server refuses. Waiting for a round trip made every delete feel
-        // broken on shared storage, where a request can take many seconds.
+    fun deleteWorkspace(workspace: Workspace) = task {
+        // Only remove local state after the server confirms deletion. A failed
+        // request preserves the project and any conversation the user is viewing.
+        withContext(Dispatchers.IO) { api.call("workspaces/${workspace.id}", "DELETE") }
         val wasSelected = state.value.selected?.id == workspace.id
+        if (wasSelected) {
+            selectionRevision++
+            stopMonitor()
+            browseCall?.cancel()
+            browserRevision++
+        }
         mutable.update { it.copy(
             workspaces = it.workspaces.filterNot { item -> item.id == workspace.id },
             selected = if (wasSelected) null else it.selected,
             chat = if (wasSelected) null else it.chat, chats = if (wasSelected) emptyList() else it.chats,
             entries = if (wasSelected) emptyList() else it.entries, browserPath = if (wasSelected) "" else it.browserPath,
+            browserParent = if (wasSelected) "" else it.browserParent,
+            browserLoading = if (wasSelected) false else it.browserLoading,
+            consent = if (wasSelected) false else it.consent,
             terminalId = if (wasSelected) null else it.terminalId) }
-        if (wasSelected) {
-            streaming = null
-            streamCall?.cancel()
-        }
-        task {
-            withContext(Dispatchers.IO) { api.call("workspaces/${workspace.id}", "DELETE") }
-            val all = runCatching {
-                withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
-            }.getOrElse { return@task }
-            mutable.update { current ->
-                // A failed delete must not silently drop the row for good.
-                if (current.workspaces.any { it.id == workspace.id }) current
-                else current.copy(workspaces = all)
-            }
-            // Only when the removed project was the active one do we move on to
-            // a replacement. Removing some other workspace must leave the
-            // current project, chat and terminal exactly as they were.
-            if (!wasSelected) return@task
-            val next = mutable.value.workspaces.firstOrNull()
-            if (next != null) select(next)
-        }
+        if (wasSelected) state.value.workspaces.firstOrNull()?.let(::select)
     }
     fun terminal() = task {
         val workspace = state.value.selected ?: return@task
@@ -458,4 +479,46 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         withContext(Dispatchers.IO) { api.call("terminals/$id", "DELETE") }
         mutable.update { if (it.terminalId == id) it.copy(terminalId = null) else it }
     }
+    /**
+     * "Open in terminal" from the viewer. An existing shell for this workspace is
+     * reused with a cd, so terminal history survives the jump; otherwise a new
+     * one starts directly in that folder.
+     */
+    fun openTerminalAt(directory: String, command: String? = null) {
+        viewModelScope.launch {
+            val workspace = state.value.selected ?: return@launch
+            val line = "cd " + shellQuote(directory) + NEWLINE + (command?.let { it + NEWLINE } ?: "")
+            val existing = state.value.terminalId
+            if (existing != null) {
+                val moved = runCatching {
+                    withContext(Dispatchers.IO) { api.call("terminals/$existing", "POST", terminalInput(line)) }
+                }.isSuccess
+                if (moved) return@launch
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    api.call("terminals", "POST", JSONObject().put("workspaceId", workspace.id).put("cwd", directory))
+                }
+            }.onSuccess { value ->
+                val id = value.getString("id")
+                mutable.update { it.copy(terminalId = id) }
+                // A fresh shell already starts in that directory; only the command
+                // still has to be typed into it.
+                if (command != null) runCatching {
+                    withContext(Dispatchers.IO) { api.call("terminals/$id", "POST", terminalInput(command + NEWLINE)) }
+                }
+            }.onFailure { error(it.message ?: tr("打开终端失败")) }
+        }
+    }
+    private fun terminalInput(text: String) = JSONObject().put("type", "input")
+        .put("data", android.util.Base64.encodeToString(text.toByteArray(), android.util.Base64.NO_WRAP))
+}
+
+// Quoting built from char codes: a backslash literal in the source was exactly
+// the kind of escaping that broke this project's launch script once already.
+private val NEWLINE = 0x0a.toChar()
+internal fun shellQuote(value: String): String {
+    val quote = 0x27.toChar()
+    val backslash = 0x5c.toChar()
+    return quote + value.replace(quote.toString(), quote.toString() + backslash + quote + quote) + quote
 }
