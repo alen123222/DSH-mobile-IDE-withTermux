@@ -1,33 +1,34 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { t } from './i18n.mjs';
 
 export class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 export function text(value, name, max = 8192) {
   if (typeof value !== 'string' || !value.trim() || value.length > max || value.includes('\0')) {
-    throw new ApiError(400, `${name} 必须是有效的非空字符串`);
+    throw new ApiError(400, name + t(' 必须是有效的非空字符串'));
   }
   return value;
 }
 export function directory(value) {
-  text(value, '目录');
-  if (!path.isAbsolute(value)) throw new ApiError(400, '请选择绝对路径');
+  text(value, t('目录'));
+  if (!path.isAbsolute(value)) throw new ApiError(400, t('请选择绝对路径'));
   let result;
   try { result = fs.realpathSync(value); }
   catch (error) {
-    if (error.code === 'ENOENT') throw new ApiError(404, '目录不存在');
-    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有访问该目录的权限');
+    if (error.code === 'ENOENT') throw new ApiError(404, t('目录不存在'));
+    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, t('没有访问该目录的权限'));
     throw error;
   }
   let stat;
   try { stat = fs.statSync(result); }
   catch (error) {
-    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, '没有访问该目录的权限');
+    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403, t('没有访问该目录的权限'));
     throw error;
   }
-  if (!stat.isDirectory()) throw new ApiError(400, '该路径不是文件夹');
+  if (!stat.isDirectory()) throw new ApiError(400, t('该路径不是文件夹'));
   // R_OK|X_OK is the wrong test for shared storage: Android's FUSE mount often
   // reports a bare directory as non-readable until it has been opened, and
   // refusing here made /sdcard and /storage/emulated/0 unreachable. Listing is

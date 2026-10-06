@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { ApiError, text, writeJson, readJson, executable, killProcessTree } from './util.mjs';
 import { connectionSettings, connectionSignature, writeProviderPatch } from './providers.mjs';
+import { t } from './i18n.mjs';
 
 // Matches DSH 0.2.0-rc.2's SDK protocol. Every process has one immutable cwd.
 // The SDK has no approval-response or cancel method; execution consent is
@@ -21,7 +22,7 @@ export class DshSessions {
       const data = readJson(path.join(dir, name));
       if (!data?.id) continue;
       this.sessions.set(data.id, { ...data, status: 'archived', starred: data.starred === true,
-        process: null, pending: new Map(), listeners: new Set() });
+        process: null, pending: new Map(), listeners: new Set(), generation: 0, runId: 0, requestId: 0, disposed: false });
     }
   }
   dshBin() {
@@ -30,8 +31,8 @@ export class DshSessions {
   }
   create(workspace) {
     const item = { id: `pocket-${crypto.randomUUID()}`, workspaceId: workspace.id, cwd: workspace.path,
-      title: '新会话', messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
-      pending: new Map(), listeners: new Set(), process: null, generation: 0, disposed: false };
+      title: t('新会话'), messages: [], events: [], status: 'ready', revision: 0, createdAt: Date.now(), starred: false,
+      pending: new Map(), listeners: new Set(), process: null, generation: 0, runId: 0, requestId: 0, disposed: false };
     this.sessions.set(item.id, item);
     this.save(item);
     return this.snapshot(item);
@@ -44,17 +45,14 @@ export class DshSessions {
   }
   remove(id) {
     const item = this.sessions.get(id);
-    if (!item) throw new ApiError(404, '会话不存在');
-    if (item.status === 'running') throw new ApiError(409, '请先停止当前任务，再删除此对话');
+    if (!item) throw new ApiError(404, t('会话不存在'));
+    if (item.status === 'running') throw new ApiError(409, t('请先停止当前任务，再删除此对话'));
     // Disposed must be set before anything else: the child we are about to kill
     // will fire an exit handler, and a pending debounced flush must not rewrite
     // the transcript we are about to unlink.
     item.disposed = true;
-    item.generation++;
+    this.terminate(item);
     this.cancelSave(item);
-    const child = item.process;
-    item.process = null;
-    if (child) killProcessTree(child);
     for (const listener of item.listeners) { try { listener(this.snapshot({ ...item, status: 'deleted' })); } catch { /* Dropped client. */ } }
     item.listeners.clear();
     this.sessions.delete(id);
@@ -73,7 +71,7 @@ export class DshSessions {
   }
   get(id) {
     const item = this.sessions.get(id);
-    if (!item) throw new ApiError(404, '会话不存在');
+    if (!item) throw new ApiError(404, t('会话不存在'));
     return item;
   }
   // Incremental read: an unchanged session costs one small JSON object instead of
@@ -94,7 +92,7 @@ export class DshSessions {
     return { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error, starred: starred === true };
   }
   list(workspaceId) {
-    return [...this.sessions.values()].filter(s => s.workspaceId === workspaceId)
+    return [...this.sessions.values()].filter(s => !workspaceId || s.workspaceId === workspaceId)
       .sort((a, b) => Number(Boolean(b.starred)) - Number(Boolean(a.starred)) || b.createdAt - a.createdAt)
       .map(s => ({ ...this.snapshot(s), messages: undefined, events: undefined }));
   }
@@ -140,7 +138,7 @@ export class DshSessions {
     return () => item.listeners.delete(send);
   }
   fail(item, error) {
-    if (item.status === 'stopped' || item.status === 'archived') return;
+    if (item.disposed || item.status === 'stopped' || item.status === 'archived') return;
     item.status = 'error';
     item.error = this.redact(item, error.message || String(error));
     this.touch(item);
@@ -153,7 +151,7 @@ export class DshSessions {
   request(item, method, params) {
     const id = ++item.requestId;
     const child = item.process;
-    if (!child) return Promise.reject(new Error('DSH 进程不可用'));
+    if (!child) return Promise.reject(new Error(t('DSH 进程不可用')));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         item.pending.delete(id);
@@ -166,11 +164,10 @@ export class DshSessions {
   async start(item, settings) {
     settings = connectionSettings(settings);
     const binary = this.dshBin();
-    if (!binary) throw new ApiError(409, '尚未安装 DSH，请先在环境页安装引擎');
-    if (process.platform === 'win32' && !this.options.command) throw new ApiError(501, '此启动器面向 Termux；电脑端仅运行协议测试');
+    if (!binary) throw new ApiError(409, t('尚未安装 DSH，请先在环境页安装引擎'));
+    if (process.platform === 'win32' && !this.options.command) throw new ApiError(501, t('此启动器面向 Termux；电脑端仅运行协议测试'));
     item.apiKey = settings.apiKey || '';
     item.stderr = '';
-    item.requestId = 0;
     item.notificationBuffer = [];
     item.receipt = null;
     item.consumed = false;
@@ -207,14 +204,14 @@ export class DshSessions {
       // readline otherwise retains unbounded input if a broken runtime omits newlines.
       if (!live()) return;
       bytes += chunk.length;
-      if (bytes > 8 * 1024 * 1024) { this.fail(item, new Error('DSH 协议帧超出限制')); killProcessTree(child); }
+      if (bytes > 8 * 1024 * 1024) { this.fail(item, new Error(t('DSH 协议帧超出限制'))); killProcessTree(child); }
       if (chunk.includes(10)) bytes = 0;
     });
     lines.on('line', line => {
       if (!live()) return;
       try {
         const frame = JSON.parse(line);
-        if (frame.jsonrpc !== '2.0') throw new Error('DSH 返回了未知协议');
+        if (frame.jsonrpc !== '2.0') throw new Error(t('DSH 返回了未知协议'));
         if (frame.id !== undefined) {
           const pending = item.pending.get(frame.id);
           if (!pending) return;
@@ -225,26 +222,26 @@ export class DshSessions {
       } catch (error) { this.fail(item, new Error(`DSH 协议解析失败：${error.message}`)); killProcessTree(child); }
     });
     const response = await this.request(item, 'initialize', { cwd: item.cwd,
-      provider: settings.provider, model: text(settings.model, '模型名称', 200), maxTokens: settings.maxTokens ?? 8192 });
-    if (response?.serverInfo?.name !== 'deepseek-harness-sdk-runtime') throw new Error('DSH SDK 版本不兼容');
+      provider: settings.provider, model: text(settings.model, t('模型名称'), 200), maxTokens: settings.maxTokens ?? 8192 });
+    if (response?.serverInfo?.name !== 'deepseek-harness-sdk-runtime') throw new Error(t('DSH SDK 版本不兼容'));
   }
   notification(item, frame) {
     const params = frame.params;
     if (!params || params.sessionId !== item.id) return; // Child output must not replace the root answer.
     if (item.status !== 'running') return;
     if (!item.receipt) {
-      if (item.notificationBuffer.length >= 10000) throw new Error('DSH 回执前事件过多');
+      if (item.notificationBuffer.length >= 10000) throw new Error(t('DSH 回执前事件过多'));
       item.notificationBuffer.push(frame);
       return;
     }
     if (frame.method === 'session.event') {
       const event = params.event;
-      if (!event || typeof event.type !== 'string') throw new Error('无效的 DSH 事件');
+      if (!event || typeof event.type !== 'string') throw new Error(t('无效的 DSH 事件'));
       if (event.type === 'agent/inbox/spliced' && event.data?.inserted?.some(m => m.id === item.receipt)) item.consumed = true;
       if (!item.consumed) return;
       if (event.type === 'assistant/message') {
         const content = event.data?.message?.content;
-        if (!Array.isArray(content)) throw new Error('无效的助手消息');
+        if (!Array.isArray(content)) throw new Error(t('无效的助手消息'));
         const value = content.filter(c => c.type === 'text').map(c => c.text).join('');
         if (value) {
           item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now() });
@@ -268,37 +265,43 @@ export class DshSessions {
   }
   async prompt(id, body) {
     const item = this.get(id);
-    if (body.allowExecution !== true) throw new ApiError(403, '请先允许此会话执行命令和修改文件');
-    if (item.status === 'stopped') this.resume(item.id);
-    if (item.status === 'archived') throw new ApiError(409, '此会话来自上次运行，请在侧栏新建对话继续');
-    if (item.status !== 'ready') throw new ApiError(409, item.status === 'running' ? '任务仍在运行' : '此会话当前不可用');
-    text(body.prompt, '消息', 100000);
-    text(body.model, '模型名称', 200);
+    if (body.allowExecution !== true) throw new ApiError(403, t('请先允许此会话执行命令和修改文件'));
+    // A chat restored from a previous run is continuable: the engine persists its
+    // sessions under DSH_HOME, so resuming hands the history back instead of
+    // forcing the user to start over in a new chat.
+    if (['stopped', 'error', 'archived'].includes(item.status)) this.resume(item.id);
+    if (item.status !== 'ready') throw new ApiError(409, item.status === 'running' ? t('任务仍在运行') : t('此会话当前不可用'));
+    text(body.prompt, t('消息'), 100000);
+    text(body.model, t('模型名称'), 200);
     const settings = connectionSettings(body);
-    if (!settings.apiKey && !this.options.command) throw new ApiError(400, '请在环境页保存 API Key');
-    if (item.process && item.connectionSignature !== connectionSignature(settings)) throw new ApiError(409, 'API 连接或模型已更改，请新建会话使设置生效');
-    if (!this.dshBin()) throw new ApiError(409, '尚未安装 DSH，请先在环境页安装引擎');
+    if (!settings.apiKey && !this.options.command) throw new ApiError(400, t('请在环境页保存 API Key'));
+    if (item.process && item.connectionSignature !== connectionSignature(settings)) throw new ApiError(409, t('API 连接或模型已更改，请新建会话使设置生效'));
+    if (!this.dshBin()) throw new ApiError(409, t('尚未安装 DSH，请先在环境页安装引擎'));
     item.status = 'running';
     item.error = undefined;
     item.receipt = null;
     item.consumed = false;
     item.notificationBuffer = [];
     item.messages.push({ id: crypto.randomUUID(), role: 'user', text: body.prompt, time: Date.now() });
-    if (item.title === '新会话') item.title = body.prompt.slice(0, 40);
+    if (item.title === t('新会话')) item.title = body.prompt.slice(0, 40);
     this.touch(item);
     this.flush(item);
+    const runId = ++item.runId;
+    const live = () => !item.disposed && item.runId === runId;
     // Return a durable enqueue acknowledgement immediately; UI observes the snapshot revision.
     void (async () => {
       try {
         if (!item.process) await this.start(item, body);
-        if (item.status !== 'running') return;
+        if (!live() || item.status !== 'running') return;
         const response = await this.request(item, 'session/prompt', { sessionId: item.id, contentBlocks: [{ type: 'text', text: body.prompt }] });
-        item.receipt = text(response?.messageId, 'DSH 消息回执');
+        if (!live()) return;
+        item.receipt = text(response?.messageId, t('DSH 消息回执'));
         const buffered = item.notificationBuffer.splice(0);
         for (const frame of buffered) this.notification(item, frame);
       } catch (error) {
+        if (!live()) return;
         this.fail(item, error);
-        if (item.process) killProcessTree(item.process);
+        this.terminate(item);
       }
     })();
     return this.snapshot(item);
@@ -316,12 +319,19 @@ export class DshSessions {
   // and a resume() that nulled it crashed the whole service on a null deref.
   terminate(item) {
     const child = item.process;
-    if (!child || child.exitCode !== null) { item.process = null; return; }
     item.generation++; // Retire this child before its exit handler can report.
+    item.runId++;
     item.process = null;
+    for (const pending of item.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(t('DSH 请求已取消')));
+    }
+    item.pending.clear();
+    item.apiKey = '';
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
     killProcessTree(child);
     const escalation = setTimeout(() => {
-      try { if (child.exitCode === null) killProcessTree(child, 'SIGKILL'); }
+      try { if (child.exitCode === null && child.signalCode === null) killProcessTree(child, 'SIGKILL'); }
       catch { /* Already reaped. */ }
     }, 2500);
     escalation.unref();
@@ -332,7 +342,7 @@ export class DshSessions {
   // prompt transparently spawns a fresh engine with the same history and cwd.
   resume(id) {
     const item = this.get(id);
-    if (item.status === 'running') throw new ApiError(409, '任务仍在运行');
+    if (item.status === 'running') throw new ApiError(409, t('任务仍在运行'));
     this.terminate(item);
     item.status = 'ready';
     item.error = undefined;

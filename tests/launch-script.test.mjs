@@ -16,6 +16,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const bash = process.env.BASH || (process.platform === 'win32'
+  ? path.resolve(execFileSync('where.exe', ['git'], { encoding: 'utf8' }).trim().split(/\r?\n/)[0], '..', '..', 'bin', 'bash.exe')
+  : 'bash');
 const TOKEN = 'a'.repeat(64);
 
 const asScriptBlock = text => (text.endsWith('\n') ? text : text + '\n');
@@ -35,7 +38,7 @@ function guardScript(token) {
             .then(r => { if (r.ok) { console.log('DSH Pocket: local service already running'); process.exit(0); } process.exit(1); })
             .catch(() => process.exit(1));
         " 2>/dev/null; then exit 0; fi
-        if node -e "fetch('http://127.0.0.1:8765/v1/health', { signal: AbortSignal.timeout(1200) }).then(() => process.exit(3)).catch(() => process.exit(1))" 2>/dev/null; then
+        if node -e "fetch('http://127.0.0.1:8765/v1/health', { signal: AbortSignal.timeout(1200) }).then(() => process.exit(0)).catch(() => process.exit(1))" 2>/dev/null; then
           echo 'DSH Pocket: port 8765 is held by a service this app cannot authenticate with.'
           echo 'Run in Termux: pkill -f server.mjs'
           exit 1
@@ -78,7 +81,7 @@ function check(label, script) {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pocket-sh-')), 'script.sh');
   fs.writeFileSync(file, script);
   try {
-    execFileSync('bash', ['-n', file], { stdio: 'pipe' });
+    execFileSync(bash, ['-n', file], { stdio: 'pipe' });
   } catch (error) {
     assert.fail(`${label} is not valid bash:\n${error.stderr?.toString()}`);
   }
@@ -114,9 +117,9 @@ test('trimIndent alone would have produced the broken script', () => {
   assert.notEqual(broken, asScriptBlock(broken));
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pocket-sh-')), 'broken.sh');
   fs.writeFileSync(file, broken + 'export X=1\n');
-  assert.throws(() => execFileSync('bash', ['-n', file], { stdio: 'pipe' }), 'the glued form really is a syntax error');
+  assert.throws(() => execFileSync(bash, ['-n', file], { stdio: 'pipe' }), 'the glued form really is a syntax error');
   fs.writeFileSync(file, asScriptBlock(broken) + 'export X=1\n');
-  execFileSync('bash', ['-n', file], { stdio: 'pipe' });
+  execFileSync(bash, ['-n', file], { stdio: 'pipe' });
   fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });
 

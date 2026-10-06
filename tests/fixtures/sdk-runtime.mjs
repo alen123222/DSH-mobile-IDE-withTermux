@@ -5,9 +5,11 @@ for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   if (request.method === 'initialize') {
     cwd = request.params.cwd;
-    send({ id: request.id, result: { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } } });
+    if (request.params.model === 'slow-init') await new Promise(resolve => setTimeout(resolve, 500));
+    send({ id: request.id, result: { serverInfo: { name: request.params.model === 'bad-init' ? 'wrong-runtime' : 'deepseek-harness-sdk-runtime', version: '0.0.1' } } });
   } else if (request.method === 'session/prompt') {
     const { sessionId, contentBlocks } = request.params;
+    if (contentBlocks[0].text === 'slow-receipt') await new Promise(resolve => setTimeout(resolve, 500));
     const messageId = 'message-' + request.id;
     const notify = (method, params) => send({ method, params: { sessionId, ...params } });
     // Exercise both races: initial idle before receipt, and events before RPC reply.

@@ -8,6 +8,7 @@ import { ApiError, safeEqual, writeJson, readJson, executable } from './util.mjs
 import { Workspaces } from './workspaces.mjs';
 import { Terminals } from './terminals.mjs';
 import { DshSessions } from './dsh.mjs';
+import { inLanguage, languageOf, t } from './i18n.mjs';
 
 // Server-Sent Events. The DSH session events already arrive live in dsh.mjs;
 // this only gives the phone a push channel instead of a 900 ms poll. The
@@ -24,7 +25,7 @@ function stream(req, res, chats, id) {
   const send = snapshot => {
     if (snapshot === null) { done(); return; } // Service shutting down.
     try {
-      if (snapshot.status === 'deleted') res.write('event: deleted\ndata: {}\n\n');
+      if (snapshot.status === 'deleted') { res.write('event: deleted\ndata: {}\n\n'); done(); res.end(); }
       else res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
     } catch { done(); }
   };
@@ -35,18 +36,20 @@ function stream(req, res, chats, id) {
 }
 
 async function bodyOf(request) {
-  if (!request.headers['content-type']?.startsWith('application/json')) throw new ApiError(415, '请求必须为 JSON');
+  if (!request.headers['content-type']?.startsWith('application/json')) throw new ApiError(415, t('请求必须为 JSON'));
   let size = 0; const chunks = [];
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 512 * 1024) throw new ApiError(413, '请求内容过大');
+    // File saves are the reason this is not 512 KB: an edited source file has to
+    // fit in the request body, and the endpoint is loopback-only and token-gated.
+    if (size > 8 * 1024 * 1024) throw new ApiError(413, t('请求内容过大'));
     chunks.push(chunk);
   }
   try {
     const result = JSON.parse(Buffer.concat(chunks).toString());
     if (!result || Array.isArray(result) || typeof result !== 'object') throw new Error();
     return result;
-  } catch { throw new ApiError(400, '无效的 JSON 请求'); }
+  } catch { throw new ApiError(400, t('无效的 JSON 请求')); }
 }
 
 export function createBridge({ stateDir, token, dshOptions = {} }) {
@@ -57,30 +60,48 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     const send = (status, data) => { res.writeHead(status); res.end(JSON.stringify(data)); };
+    // Resolve every message in the caller's language for this request only.
+    await inLanguage(languageOf(req), async () => {
     try {
-      if (req.headers.origin) throw new ApiError(403, '浏览器来源不可调用本地执行服务');
-      if (!safeEqual(req.headers.authorization || '', `Bearer ${token}`)) throw new ApiError(401, '连接密钥不匹配，请重新连接 Termux');
+      if (req.headers.origin) throw new ApiError(403, t('浏览器来源不可调用本地执行服务'));
+      if (!safeEqual(req.headers.authorization || '', `Bearer ${token}`)) throw new ApiError(401, t('连接密钥不匹配，请重新连接 Termux'));
       const url = new URL(req.url, 'http://127.0.0.1');
       const parts = url.pathname.split('/').filter(Boolean);
       const method = req.method;
-      if (parts[0] !== 'v1') throw new ApiError(404, '接口不存在');
+      if (parts[0] !== 'v1') throw new ApiError(404, t('接口不存在'));
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
-      if (method === 'GET' && parts[1] === 'health') result = { version: '0.3.8', platform: process.platform, arch: process.arch,
+      if (method === 'GET' && parts[1] === 'health') result = { version: '0.4.3', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
-      else if (method === 'GET' && parts[1] === 'shortcuts') result = await workspaces.shortcuts();
+      else if (method === 'GET' && parts[1] === 'shortcuts') result = { items: await workspaces.shortcuts((url.searchParams.get('external') || '').split('\n')) };
+      else if (method === 'POST' && parts[1] === 'workspace-check') result = await workspaces.validate(body.path);
       else if (method === 'GET' && parts[1] === 'browse') result = await workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');
       else if (method === 'POST' && parts[1] === 'directories') result = workspaces.create(body.parent, body.name);
       else if (method === 'GET' && parts[1] === 'workspaces') result = { items: workspaces.all() };
-      else if (method === 'POST' && parts[1] === 'workspaces' && !parts[2]) result = workspaces.add(body.path);
+      else if (method === 'POST' && parts[1] === 'workspaces' && !parts[2]) result = await workspaces.add(body.path);
       else if (method === 'DELETE' && parts[1] === 'workspaces' && parts[2]) { workspaces.remove(parts[2]); result = { ok: true }; }
       else if (method === 'POST' && parts[1] === 'workspaces' && parts[3] === 'star') result = workspaces.star(parts[2], body.starred);
-      else if (method === 'GET' && parts[1] === 'file') result = workspaces.read(url.searchParams.get('workspaceId'), url.searchParams.get('path'));
-      else if (method === 'POST' && parts[1] === 'terminals' && !parts[2]) result = terminals.open(workspaces.get(body.workspaceId));
+      else if (method === 'GET' && parts[1] === 'file') result = workspaces.file(url.searchParams.get('workspaceId'), url.searchParams.get('path'));
+      else if (method === 'POST' && parts[1] === 'file') result = workspaces.save(
+        body.workspaceId || url.searchParams.get('workspaceId'), body.path, body);
+      else if (method === 'GET' && parts[1] === 'raw') {
+        // Stream the bytes. Base64 inside JSON would inflate a photo by a third
+        // and hold it in memory twice over.
+        const info = workspaces.raw(url.searchParams.get('workspaceId'), url.searchParams.get('path'));
+        res.writeHead(200, { 'Content-Type': info.mime, 'Content-Length': String(info.size), 'Cache-Control': 'no-store' });
+        const source = fs.createReadStream(info.path);
+        source.on('error', () => res.destroy());
+        res.on('close', () => source.destroy());
+        source.pipe(res);
+        return;
+      }
+      else if (method === 'POST' && parts[1] === 'extract') result = workspaces.extract(
+        body.workspaceId || url.searchParams.get('workspaceId'), body.path);
+      else if (method === 'POST' && parts[1] === 'terminals' && !parts[2]) result = terminals.open(workspaces.get(body.workspaceId), body.cwd);
       else if (method === 'GET' && parts[1] === 'terminals') {
         const after = Number(url.searchParams.get('after') || 0);
-        if (!Number.isSafeInteger(after) || after < 0) throw new ApiError(400, '无效的终端游标');
+        if (!Number.isSafeInteger(after) || after < 0) throw new ApiError(400, t('无效的终端游标'));
         result = terminals.poll(parts[2], after);
       } else if (method === 'POST' && parts[1] === 'terminals' && parts[2]) { terminals.write(parts[2], body); result = { ok: true }; }
       else if (method === 'DELETE' && parts[1] === 'terminals') { terminals.close(parts[2]); result = { ok: true }; }
@@ -96,12 +117,13 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'resume') result = chats.resume(parts[2]);
       else if (method === 'POST' && parts[1] === 'chats' && parts[3] === 'star') result = chats.star(parts[2], body.starred);
       else if (method === 'DELETE' && parts[1] === 'chats' && parts[2]) result = chats.remove(parts[2]);
-      else throw new ApiError(404, '接口不存在');
+      else throw new ApiError(404, t('接口不存在'));
       send(200, result);
     } catch (error) {
       const status = error.status || ({ ENOENT: 404, EACCES: 403, EPERM: 403, EEXIST: 409 }[error.code]) || 500;
-      send(status, { error: error.message || '操作失败' });
+      send(status, { error: error.message || t('操作失败') });
     }
+    });
   });
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;

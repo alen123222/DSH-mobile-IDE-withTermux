@@ -59,17 +59,41 @@ test('workspaces use original independent folders and reject relative/missing/fi
   assert.equal(fs.readFileSync(path.join(projects[0], 'original.txt'), 'utf8'), 'still here');
 });
 
-test('file preview stays within selected workspace and refuses binary and oversized files', async t => {
+test('the file API classifies text, keeps binary viewable and refuses escapes', async t => {
   const { request, projects } = await setup(t);
   const { body: workspace } = await request('workspaces', { method: 'POST', body: { path: projects[0] } });
   const inside = path.join(projects[0], 'hello.txt'), outside = path.join(projects[1], 'other.txt');
   fs.writeFileSync(inside, '你好'); fs.writeFileSync(outside, 'private');
-  const preview = filename => request(`file?${new URLSearchParams({ workspaceId: workspace.id, path: filename })}`);
-  assert.equal((await preview(inside)).body.content, '你好');
-  assert.equal((await preview(outside)).status, 403);
-  fs.writeFileSync(inside, Buffer.from([0, 1, 2])); assert.equal((await preview(inside)).status, 415);
-  fs.writeFileSync(inside, Buffer.alloc(600000, 65)); assert.equal((await preview(inside)).status, 413);
+  const meta = filename => request(`file?${new URLSearchParams({ workspaceId: workspace.id, path: filename })}`);
+  const info = (await meta(inside)).body;
+  assert.equal(info.kind, 'text');
+  assert.equal(info.text, '你好');
+  assert.equal((await meta(outside)).status, 403);
+  // Binary used to be a 415 dead end; the viewer now hands it to another app.
+  fs.writeFileSync(inside, Buffer.from([0, 1, 2]));
+  assert.equal((await meta(inside)).body.kind, 'binary');
+  // Oversized text is not loaded, but the metadata still answers.
+  fs.writeFileSync(inside, Buffer.alloc(600000, 65));
+  assert.equal((await meta(inside)).body.kind, 'text');
+  fs.writeFileSync(inside, Buffer.alloc(3 * 1024 * 1024, 65));
+  assert.equal((await meta(inside)).body.kind, 'binary');
+  // Same fence on the byte and save endpoints as on the metadata one.
+  assert.equal((await request(`raw?${new URLSearchParams({ workspaceId: workspace.id, path: outside })}`)).status, 403);
+  assert.equal((await request('file', { method: 'POST', body: { workspaceId: workspace.id, path: outside, content: 'x' } })).status, 403);
   assert.equal((await request('directories', { method: 'POST', body: { parent: projects[0], name: '../escape' } })).status, 400);
+});
+
+test('bridge messages follow the Accept-Language header', async t => {
+  const { base, token } = await setup(t);
+  const error = async language => {
+    const response = await fetch(base + 'workspaces/does-not-exist', {
+      method: 'DELETE', headers: { Authorization: 'Bearer ' + token, 'Accept-Language': language } });
+    return (await response.json()).error;
+  };
+  // No header at all stays Chinese, which is what the tests and curl rely on.
+  assert.match(await error(''), /工作区不存在/);
+  assert.match(await error('zh-CN,zh;q=0.9'), /工作区不存在/);
+  assert.equal(await error('en-US,en;q=0.9'), 'That workspace does not exist');
 });
 
 async function waitChat(request, id, predicate) {
@@ -300,7 +324,7 @@ test('deleting a finished session keeps it deleted', async t => {
   await request(`chats/${chat.id}`, { method: 'DELETE' });
   const file = path.join(stateDir, 'chats', `${chat.id}.json`);
   assert.equal(fs.existsSync(file), false);
-  if (child && child.exitCode === null) await new Promise(resolve => child.on('exit', resolve));
+  if (child && child.exitCode === null && child.signalCode === null) await once(child, 'exit');
   await new Promise(resolve => setTimeout(resolve, 700));
   assert.equal(fs.existsSync(file), false, 'a dead engine must not rewrite the transcript');
   assert.equal(new DshSessions(stateDir, {}).sessions.has(chat.id), false, 'the record stays gone across a restart');
@@ -351,4 +375,55 @@ test('real PTY retains cd and shell variables across inputs', { skip: process.pl
   }
   assert.ok(output.includes(`RESULT=${projects[1]}|persisted`), output);
   await request(`terminals/${terminal.id}`, { method: 'DELETE' });
+});
+
+test('stopping pending initialization cannot poison a resumed turn after its old deadline', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  const item = bridge.chats.get(chat.id);
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'first', model: 'slow-init', allowExecution: true } });
+  assert.equal(item.pending.size, 1);
+  await request(`chats/${chat.id}/stop`, { method: 'POST', body: {} });
+  assert.equal(item.pending.size, 0);
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'wait', model: 'test', allowExecution: true } });
+  await new Promise(resolve => setTimeout(resolve, 2300));
+  assert.equal(item.status, 'running', item.error);
+  assert.ok(item.receipt);
+  assert.equal(item.process.signalCode, null);
+});
+
+test('an errored runtime can restart in the same conversation', async t => {
+  const { request, projects } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'first', model: 'bad-init', allowExecution: true } });
+  await waitChat(request, chat.id, c => c.status === 'error');
+  assert.equal((await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'recovered', model: 'test', allowExecution: true } })).status, 200);
+  const result = await waitChat(request, chat.id, c => c.status === 'ready');
+  assert.match(result.messages.at(-1).text, /recovered$/);
+});
+
+test('a chat restored from a previous run can be continued', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  // The next app launch reads the record back from disk as archived; asking again
+  // must resume it instead of answering 409.
+  bridge.chats.get(chat.id).status = 'archived';
+  const response = await request(`chats/${chat.id}/prompt`,
+    { method: 'POST', body: { prompt: 'continued', model: 'test', allowExecution: true } });
+  assert.equal(response.status, 200);
+  const result = await waitChat(request, chat.id, c => c.status === 'ready');
+  assert.match(result.messages.at(-1).text, /continued$/);
+});
+
+test('storage shortcuts use the object envelope consumed by Android and path checks leave no file', async t => {
+  const { request, projects } = await setup(t);
+  const shortcuts = (await request('shortcuts')).body;
+  assert.ok(Array.isArray(shortcuts.items));
+  const before = fs.readdirSync(projects[0]);
+  const checked = await request('workspace-check', { method: 'POST', body: { path: projects[0] } });
+  assert.equal(checked.body.writable, true);
+  assert.deepEqual(fs.readdirSync(projects[0]), before);
 });
