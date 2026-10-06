@@ -4,7 +4,7 @@
 
 DSH Pocket 将 Kotlin / Jetpack Compose 界面、手机本地执行服务和适配 Android arm64 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 连接起来。可以在聊天中让模型操作项目，也可以直接打开终端，执行命令、安装工具、编译代码。
 
-当前版本：**0.3.0-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
+当前版本：**0.4.3-dev，开发预览版**。项目使用手机已安装的 Termux，工作区文件保留原位置，无需导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目无隶属关系。
 
 ## 目录
 
@@ -235,6 +235,28 @@ App 自动配置 DSH Provider，不需要手填内部名称。自定义 OpenAI �
 - 普通 Termux 无法访问其他 App 的私有目录。
 - 共享存储的执行位和符号链接行为不同，复杂构建建议放在 HOME。
 
+### 外接 SD 卡 / USB 硬盘
+
+在「添加工作区」中点「刷新存储」。快捷入口只保留三个：`主目录`、`内部存储` 和 `外接存储 · 卷标`（卷标来自 Android 的可移动存储列表，或 `/storage` 下真实存在的挂载卷）。也可以直接输入 `/storage/XXXX-XXXX/projects` 或 `~/storage/external-1/projects`。目录链接可正常浏览，不必把项目复制进 App。
+
+1. 先在 Termux 执行 `termux-setup-storage`，授权后返回刷新。插拔存储后也请刷新。
+2. 「在此新建文件夹」使用输入框里的目录作为父目录；新建后可打开子目录。
+3. 「验证读写」会创建、写入、读取并删除一个随机命名的小文件。保存工作区时也会验证，失败不会保存无效项目。
+4. 外接盘根目录若不可写，尝试 `~/storage/external-1`。它通常指向卡上的 `Android/data/com.termux/files`，并非卡根目录；卸载 Termux 可能删除其中的数据。
+5. 如果所用 Termux 声明了「所有文件访问」权限，按钮可打开它的系统授权页；是否授予由用户决定。普通版本没有该权限时会打开应用设置，不会绕过 Android 限制。
+
+本应用通过 Termux 的真实文件路径执行命令。Android 文档选择器的 `content://` 授权不能自动转换成 Termux 的目录权限。未挂载、只读、权限不足的存储会报告具体错误。外接文件系统可能不支持执行位、符号链接或直接运行二进制；可在盘上编辑源码、运行 Python 等解释器，复杂构建的缓存和可执行产物建议放在 Termux HOME。
+
+参考：[Android 目录授权](https://developer.android.com/training/data-storage/shared/documents-files)、[Termux 存储说明](https://github.com/termux/termux-tools/blob/master/doc/termux.1.md.in)。
+
+### 单一 App、签名与升级
+
+项目只构建一个 App：包名 `dev.dsh.pocket`，显示名「DSH Pocket」，本地服务使用端口 8765 和 `~/.local/share/dsh-pocket`。
+
+所有构建都固定使用仓库内的 `.cache/debug.keystore`（`CN=Android Debug`，SHA-256 `04:1A:95:…:ED:77`），所以同一台机器上重新构建的 APK 可以直接覆盖安装。
+
+Android 只允许同一签名的 APK 覆盖安装。若平板上已有的安装来自另一把密钥（例如更早用其它 debug keystore 构建的版本），会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能先卸载旧 App 再安装。卸载不会删除 Termux 里的数据：引擎、聊天和工作区都在 `~/.local/share/dsh-pocket`，重新连接后仍然可用，只有 App 私有保存的 API Key 需要重新填写一次。
+
 ### 终端状态与 AI 工作区
 
 同一终端会话保留 `cd` 和 Shell 变量：
@@ -250,6 +272,38 @@ pwd
 终端中的 `cd` 只影响该终端。AI 工作区通过 App 单独选择，每个 DSH 会话启动时固定 `cwd`。让 AI 操作其他项目时，应切换工作区并新建会话。
 
 终端底部提供 Esc、Tab、Ctrl+C 和方向键。环境页也可打开原生 Termux 终端，继续使用原有工具和配置。
+
+### 打开与编辑文件
+
+文件页点一个文件就会打开全屏查看器，不再只是一个只读弹窗：
+
+- **代码 / 文本**（c、h、cpp、py、java、kt、js、ts、json、yaml、toml、xml、html、css、sql、sh、md、gradle…）：行内语法高亮，可直接编辑，右上角保存。保存是原子写入（先写临时文件再改名），权限位保持不变。保存键右边还有一个 ▶「在终端运行」：跳到该文件目录并执行（py→python3、sh→bash、js→node、rb/php/lua/pl 同理）。
+- **图片**（png、jpg、webp、gif、bmp、heic）：可双指缩放、拖动，大图按屏幕尺寸采样解码，不会把 12 MP 原图整份读进内存。
+- **PDF**：内置分页查看器，左右翻页，底部有 缩小 / 放大 / 百分比复位，也可双指缩放拖动。
+- **压缩包**（zip、jar、apk、docx、xlsx…）：列出条目与大小，右上角「解压到此处」就地解压到同名文件夹；解压失败会清理干净，并且拒绝 .. 这类越界路径。
+- **二进制**：十六进制查看器（偏移 / 十六进制 / ASCII），显示开头 64 KB，够用来认文件又不会把内存吃满。
+- **其它格式**：右上角「更多」→「用其他应用打开」，交给系统里装了对应 App 的那一个。
+
+几个刻意的设计：
+
+1. **GBK 文本照常显示**。Termux 里的中文源码常是 GBK，按 UTF-8 解码会全是乱码；桥接会先严格试 UTF-8，失败再用 GBK。Node 没有 GBK 编码器，所以 GBK 文件默认只读，点「转为 UTF-8 编辑」才会写回——中文内容不变，编码变成 UTF-8。
+2. **外部修改不会静默覆盖**。打开文件时记下 mtime，保存前再比一次；如果 DSH 在终端里改过这个文件，会提示「文件已被外部修改」，让你选择是否覆盖。
+3. **「在终端打开」**：查看器右上角菜单可直接跳到该文件所在目录。已有终端会执行一次 `cd`（保留历史），没有则在那个目录新开一个。
+4. **查找**（右上角 ⋮ → 查找）：全文高亮所有匹配，当前项用更深的底色，显示「当前 / 总数」并提供 上一个 / 下一个。
+5. 「用其他应用打开」只通过 FileProvider 暴露 App 自己缓存的副本；Termux 工作区本身从未对外开放。
+### 继续上次的对话
+
+上次运行留下的对话现在可以直接接着问：DSH 引擎把会话持久化在 DSH_HOME，所以桥接收提问时会把归档的
+会话恢复成可运行状态，引擎自己接上历史，而不是让你去侧栏新建一个。
+
+### 中文 / English
+
+界面跟随系统语言：系统是中文时显示中文，其它语言回落到英文。桥接的错误信息也跟随同一语言——
+App 在请求里带上 `Accept-Language`，Termux 侧按它选择措辞（没有这个头时默认中文，方便 curl 和测试）。
+
+文本放在两处：App 的 [Lang.kt](app/src/main/java/dev/dsh/pocket/Lang.kt) 以中文原文为键、英文为值；
+桥接的 [i18n.mjs](bridge/i18n.mjs) 同理，并用 `AsyncLocalStorage` 让语言按请求隔离。
+任何没有翻译的字符串都会原样显示中文，不会出现占位符或空白。
 
 ## 从源码构建
 
@@ -443,7 +497,7 @@ Android loader 替代了缺少 Android 预编译包的 `node-addon-require-built
 
 - DSH 安装目标仅为 Android arm64，其他 ABI 未适配。
 - 使用 `sdk-minimal`，以持久 Shell 为核心，未提供完整桌面插件管理界面。
-- 原生聊天轮询本地服务状态，助手消息按提交后的内容展示，尚未逐 token 渲染。
+- 原生聊天通过 SSE 接收更新，断线后重连并用增量轮询补齐；助手消息按提交后的内容展示，尚未逐 token 渲染。
 - 重启后保留记录，但不恢复原 DSH 进程，需要新建会话。
 - 文件页目前以浏览和预览为主，尚无完整编辑器、Git diff 审阅和冲突处理界面。
 - 预设不自动推断模型的全部能力；复杂 reasoning、图像、音频及特殊扩展可能需进一步适配。
