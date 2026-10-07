@@ -145,10 +145,21 @@ fun buildTimeline(chat: JSONObject): List<Timeline> {
     // First pass: collect each turn's work and remember where that turn started.
     class Turn(val first: Int) { val calls = ArrayList<ToolCall>(); val thinking = StringBuilder() }
     val turns = LinkedHashMap<Int, Turn>()
-    // Which turn each entry belongs to; a thinking event carries no turn of its own.
+    // Old bridge records omit the thinking turn. The next numbered event in
+    // the same user interval identifies reasoning emitted before a tool call.
+    val nextTurn = HashMap<Int, Int>()
+    var upcoming: Int? = null
+    for (entry in ordered.asReversed()) {
+        if (entry.message?.string("role") == "user") upcoming = null
+        val data = entry.event?.optJSONObject("data")
+        if (data?.has("turn") == true && !data.isNull("turn")) upcoming = data.optInt("turn")
+        upcoming?.let { nextTurn[entry.index] = it }
+    }
     val entryTurn = HashMap<Int, Int>()
     var current = Int.MIN_VALUE
+    var unnumbered = Int.MIN_VALUE
     for (entry in ordered) {
+        if (entry.message?.string("role") == "user") current = ++unnumbered
         val event = entry.event ?: continue
         val data = event.optJSONObject("data") ?: JSONObject()
         when (event.string("type")) {
@@ -169,7 +180,9 @@ fun buildTimeline(chat: JSONObject): List<Timeline> {
             "assistant/thinking" -> {
                 val text = data.string("text")
                 if (text.isNotBlank()) {
-                    val turn = current
+                    val turn = if (data.has("turn") && !data.isNull("turn")) data.optInt("turn")
+                        else nextTurn[entry.index] ?: current
+                    current = turn
                     entryTurn[entry.index] = turn
                     val work = turns.getOrPut(turn) { Turn(entry.index) }
                     if (work.thinking.isNotEmpty()) work.thinking.append('\n')
@@ -225,12 +238,15 @@ private fun BubbleRow(item: Timeline.Bubble) {
 }
 
 /** The one big fold: collapsed it is a single "DSH is working" row. */
+/** A turn says whether it is still running or has finished. */
+private fun workTitle(running: Boolean): String = if (running) tr("DSH 正在工作") else tr("DSH 运行完毕")
+
 @Composable
 private fun WorkCard(work: Timeline.Work, running: Boolean) {
     var open by remember(work.seq) { mutableStateOf(false) }
     val count = work.calls.size + (if (work.thinking.isNotEmpty()) 1 else 0)
     Fold(open = open, onToggle = { open = !open }, icon = Icons.Outlined.Build,
-        title = tr("DSH 正在工作"), note = count.toString() + tr(" 项"), strong = true, busy = running) {
+        title = workTitle(running), note = count.toString() + tr(" 项"), strong = true, busy = running) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (work.thinking.isNotEmpty()) {
                 SubFold(keyText = "think", seq = work.seq, icon = Icons.Outlined.Psychology,

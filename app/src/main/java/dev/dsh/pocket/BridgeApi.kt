@@ -16,7 +16,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.4.5"
+const val BRIDGE_VERSION = "0.5.4"
 
 /**
  * Never route through a proxy. The bridge only listens on this device's own
@@ -263,7 +263,7 @@ data class FileEntry(val name: String, val path: String, val directory: Boolean,
 }
 data class EngineSettings(val model: String = "deepseek-v4-flash", val provider: String = "deepseek-official", val apiKey: String = "", val baseUrl: String = "",
     val protocol: String = "deepseek-messages", val autoVersion: Boolean = true,
-    val contextWindow: Int = 131072, val maxTokens: Int = 8192) {
+    val contextWindow: Int = 131072, val maxTokens: Int = 8192, val reasoningEffort: String = "", val vision: Boolean = false) {
     // Kotlin default arguments do not generate Java overloads, so the Java
     // instrumentation test could no longer construct this after contextWindow
     // and maxTokens were added. Keep an explicit six-argument constructor.
@@ -274,6 +274,8 @@ data class EngineSettings(val model: String = "deepseek-v4-flash", val provider:
     fun json(): JSONObject = JSONObject().put("model", model).put("provider", route).put("apiKey", apiKey).put("baseUrl", baseUrl)
         .put("protocol", protocol).put("autoVersion", autoVersion)
         .put("contextWindow", contextWindow).put("maxTokens", maxTokens)
+        .put("reasoningEffort", reasoningEffort)
+        .put("vision", vision)
     companion object {
         fun from(json: JSONObject): EngineSettings {
             val provider = json.string("provider", "deepseek-official")
@@ -281,7 +283,7 @@ data class EngineSettings(val model: String = "deepseek-v4-flash", val provider:
             val inferred = if (provider != "deepseek-official" || url.trimEnd('/').endsWith("/chat/completions") || url.trimEnd('/').endsWith("/responses")) "openai-chat" else "deepseek-messages"
             return EngineSettings(json.string("model", "deepseek-v4-flash"), provider, json.string("apiKey"), url,
                 json.string("protocol", inferred), json.optBoolean("autoVersion", true),
-                json.optInt("contextWindow", 131072), json.optInt("maxTokens", 8192))
+                json.optInt("contextWindow", 131072), json.optInt("maxTokens", 8192), json.string("reasoningEffort"), json.optBoolean("vision", false))
         }
     }
 }

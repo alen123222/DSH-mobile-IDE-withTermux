@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -93,6 +94,7 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
                 onStarChat = model::starChat, onDeleteChat = model::deleteChat,
                 onStarWorkspace = model::starWorkspace, onDeleteWorkspace = model::deleteWorkspace)
         }
+        val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
         val content: @Composable () -> Unit = {
             Scaffold(containerColor = Surface, snackbarHost = { SnackbarHost(snackbar) }, topBar = {
                 TopAppBar(title = {
@@ -107,7 +109,9 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
                         IconButton(onClick = { model.connect(); tab = if (state.connected) tab else 3 }) { Icon(Icons.Outlined.Refresh, tr("连接或刷新")) }
                     }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface))
             }, bottomBar = {
-                NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
+                // With the keyboard up the bar sits underneath it; keeping it would
+                // reserve a blank band exactly where it used to be.
+                if (!imeVisible) NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
                     val tabs = listOf(tr("对话") to Icons.Outlined.ChatBubbleOutline, tr("文件") to Icons.Outlined.FolderOpen, tr("终端") to Icons.Outlined.Terminal, tr("环境") to Icons.Outlined.Tune)
                     tabs.forEachIndexed { index, (label, icon) ->
                         NavigationBarItem(selected = tab == index, onClick = {
@@ -118,6 +122,8 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
                     }
                 }
             }) { padding ->
+                // The keyboard is inset here rather than by Scaffold, and the bar above
+                // steps aside while it is open; the two together leave no blank band.
                 Box(Modifier.padding(padding).fillMaxSize().imePadding()) {
                     when (tab) {
                         0 -> ChatPane(state, model, onSetup = { tab = 3 }, onWorkspace = addWorkspace)
@@ -257,13 +263,50 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
     val status = chat.string("status")
     val running = status == "running"
     var input by rememberSaveable(chat.string("id")) { mutableStateOf("") }
-    var showEvents by remember { mutableStateOf(false) }
     val timeline = remember(chat) { buildTimeline(chat) }
+    val lastUser = timeline.lastOrNull { it is Timeline.Bubble && it.role == "user" }?.seq ?: 0
+    // Only the turn that is actually running may spin, and a card belongs to this
+    // run only if it was produced after the newest request. Taking the last card
+    // instead made the previous turn claim to be working from the moment a request
+    // was sent until the new turn produced its first card.
+    val activeWork = if (running) timeline.lastOrNull { it is Timeline.Work && it.seq > lastUser }?.seq else null
+    val chatId = chat.string("id")
     val listState = rememberLazyListState()
-    // Follow the transcript only while the reader is already at the bottom;
-    // otherwise a poll would yank them back down mid-read.
+    // Returning to a transcript (a tab switch, a rotation) resumes where it was
+    // left; opening a chat for the first time lands on the newest message. This
+    // has to be explicit: the list state is recreated with the composition, and
+    // it cannot rely on canScrollForward, which is only meaningful after layout.
+    LaunchedEffect(chatId) {
+        val saved = model.transcriptPosition(chatId)
+        if (saved != null) listState.scrollToItem(saved.first, saved.second)
+        else if (timeline.isNotEmpty()) listState.scrollToItem(timeline.lastIndex)
+    }
+    DisposableEffect(chatId) {
+        onDispose {
+            model.rememberTranscriptPosition(chatId, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+        }
+    }
+    // Sending always brings the newest message into view, even from further up.
+    var seenUser by remember(chatId) { mutableStateOf(lastUser) }
+    LaunchedEffect(lastUser) {
+        if (lastUser != 0 && lastUser != seenUser) {
+            seenUser = lastUser
+            if (timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
+        }
+    }
+    // Otherwise follow only while the reader is already at the bottom, and never
+    // on the first composition, which would undo the restore above.
+    var followArmed by remember(chatId) { mutableStateOf(false) }
     LaunchedEffect(timeline.size) {
-        if (timeline.isNotEmpty() && !listState.canScrollForward) listState.animateScrollToItem(timeline.size - 1)
+        if (!followArmed) { followArmed = true; return@LaunchedEffect }
+        if (timeline.isNotEmpty() && !listState.canScrollForward) listState.animateScrollToItem(timeline.lastIndex)
+    }
+    // The keyboard takes height away from the transcript, which would leave the newest
+    // message below the fold. Opening it means the reader is about to write, so bring
+    // the end of the conversation with it.
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    LaunchedEffect(imeVisible) {
+        if (imeVisible && timeline.isNotEmpty()) listState.animateScrollToItem(timeline.lastIndex)
     }
     Column(Modifier.fillMaxSize()) {
         LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 24.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(22.dp)) {
@@ -274,44 +317,21 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
                     Text(tr("描述任务，DSH 会在当前项目里工作。"), color = Color(0xFF64748B), modifier = Modifier.padding(top = 10.dp))
                 }
             }
-            items(timeline, key = { it.seq }) { item -> TimelineRow(item, running) }
+            items(timeline, key = { it.seq }) { item -> TimelineRow(item, item.seq == activeWork) }
             if (running) item { Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text(tr("DSH 正在工作…"), modifier = Modifier.padding(start = 10.dp), color = Color(0xFF64748B)) } }
             if (chat.string("error").isNotBlank()) item { Text(chat.string("error"), color = MaterialTheme.colorScheme.error) }
-        }
-        if (events.isNotEmpty()) TextButton(onClick = { showEvents = true }, modifier = Modifier.padding(start = 16.dp)) {
-            Icon(Icons.Outlined.DataObject, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(tr("查看工具活动 · ") + events.size)
         }
         // Every chat is continuable, including one restored from a previous run:
         // the engine keeps its sessions under DSH_HOME, so asking again resumes it.
         Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp).widthIn(max = 1000.dp).fillMaxWidth()) {
-            if (status in listOf("stopped", "error", "archived")) Surface(color = Color(0xFFFFF7E6), shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(when (status) {
-                        "stopped" -> tr("任务已停止，记录已保存。继续提问会在同一目录重新启动 DSH。")
-                        "archived" -> tr("上次运行的对话。继续提问会接上这段记录并重新启动 DSH。")
-                        else -> tr("上次运行出错。继续提问会重启 DSH。")
-                    }, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = Color(0xFF8A6D3B))
-                    TextButton(onClick = { model.newChat() }) { Text(tr("新建会话")) }
-                }
-            }
-            if (!state.consent) Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = state.consent, onCheckedChange = model::consent)
-                Text(tr("允许此会话在 Termux 权限范围内修改文件、执行命令"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B), modifier = Modifier.clickable { model.consent(!state.consent) })
-            }
             OutlinedTextField(value = input, onValueChange = { input = it }, placeholder = { Text(tr("描述你想完成的任务…")) }, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 6,
                 shape = RoundedCornerShape(18.dp), trailingIcon = {
                     if (running) IconButton(onClick = model::stop) { Icon(Icons.Outlined.StopCircle, tr("停止任务"), tint = MaterialTheme.colorScheme.error) }
-                    else IconButton(enabled = input.isNotBlank() && state.consent, onClick = { model.send(input); input = "" }) { Icon(Icons.AutoMirrored.Outlined.Send, tr("发送"), tint = if (state.consent) Blue else Color.Gray) }
+                    else IconButton(enabled = input.isNotBlank(), onClick = { model.send(input); input = "" }) { Icon(Icons.AutoMirrored.Outlined.Send, tr("发送"), tint = if (input.isNotBlank()) Blue else Color.Gray) }
                 })
-            Text("${state.settings.model}  ·  ${state.selected.name}", style = MaterialTheme.typography.labelSmall, color = Color(0xFF94A3B8), modifier = Modifier.padding(top = 8.dp))
+            ChatModelControls(state, model, running)
         }
     }
-    if (showEvents) AlertDialog(onDismissRequest = { showEvents = false }, title = { Text(tr("工具与运行活动")) }, text = {
-        LazyColumn(Modifier.heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(events) { event -> Column { Text(event.string("type"), fontWeight = FontWeight.SemiBold, color = Blue); SelectionContainer { Text(event.opt("data")?.toString().orEmpty(), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) } } }
-        }
-    }, confirmButton = { TextButton(onClick = { showEvents = false }) { Text(tr("关闭")) } })
 }
 
 @Composable
@@ -467,29 +487,32 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                     Text(if (state.connecting) tr("正在连接…") else if (state.connected && needsUpdate) tr("更新本地服务") else if (state.connected) tr("刷新状态") else tr("启动本地服务"))
                 }
                 if (state.connected && needsUpdate) Text(tr("本地服务版本落后，将自动更新。更新会结束终端连接，保留工作区和对话记录。"), style = MaterialTheme.typography.bodySmall)
-                state.health?.let { health -> Text("${health.string("arch")} · Node ${health.string("node")}\n${health.string("home")}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace) }
-                Text(tr("连接地址：") + model.bridgeAddress() + ":" + BuildConfig.BRIDGE_PORT, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-                if (result.isNotBlank()) SelectionContainer { Text(result, style = MaterialTheme.typography.bodySmall, modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState())) }
+                var details by remember { mutableStateOf(false) }
+                TextButton(onClick = { details = !details }) { Text(tr("运行详情")) }
+                if (details && result.isNotBlank()) Text(result, style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState()))
             }
         }
         Surface(shape = RoundedCornerShape(18.dp), color = Color.White) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(tr("DSH 引擎"), fontWeight = FontWeight.SemiBold)
                 Text(if (state.health?.string("dsh").isNullOrBlank()) tr("尚未检测到引擎") else tr("已发现 DSH · SDK 模式"), color = Color(0xFF64748B))
-                Text(tr("开发版先使用 DSH 的 sdk-minimal 配置，提供持久 Shell 和会话。模型可通过 Shell 读写代码、运行工具。"), style = MaterialTheme.typography.bodySmall)
-                OutlinedButton(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("安装 / 检查 Android 引擎")) }
-                OutlinedButton(onClick = { safe { TermuxConnection.diagnose(context) } }) { Text(tr("诊断 Termux 侧")) }
-                var probe by remember { mutableStateOf("") }
-                OutlinedButton(onClick = { model.probeReport { probe = it } }) { Text(tr("诊断 App 侧（网络原始信息）")) }
-                if (probe.isNotBlank()) SelectionContainer {
-                    Text(probe, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()))
+                var maintenance by remember { mutableStateOf(false) }
+                if (state.health?.string("dsh").isNullOrBlank()) {
+                    Button(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("安装引擎")) }
+                } else {
+                    TextButton(onClick = { maintenance = !maintenance }) { Text(tr("维护选项")) }
+                    if (maintenance) {
+                        OutlinedButton(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("更新引擎")) }
+                        TextButton(onClick = { safe { TermuxConnection.openTerminal(context, state.selected?.path ?: TermuxConnection.HOME) } }) { Text(tr("打开原生 Termux 终端")) }
+                    }
                 }
-                OutlinedButton(onClick = { safe { TermuxConnection.openTerminal(context, state.selected?.path ?: TermuxConnection.HOME) } }) { Text(tr("打开原生 Termux 终端")) }
             }
         }
         Surface(shape = RoundedCornerShape(18.dp), color = Color.White) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                PhoneControlPane()
+                HorizontalDivider()
                 ApiPresetsPane(state, model)
             }
         }

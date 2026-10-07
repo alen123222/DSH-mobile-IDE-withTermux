@@ -149,20 +149,6 @@ object TermuxConnection {
         context.startActivity(Intent(action, Uri.parse("package:com.termux")))
     }
 
-    // A shell script file is the only safe way to ship this much quoting into
-    // RUN_COMMAND. Double-escaped inline heredocs were how the previous launch
-    // script broke, so keep the diagnostic as one asset with a single writer.
-    fun diagnose(context: Context) = run(context, buildString {
-        append("ROOT=\"\$HOME/.local/share/${BuildConfig.STATE_DIRECTORY}\"\n")
-        append("export POCKET_HOME=\"\$ROOT\"\n")
-        append("echo '== 1. listener on ${BuildConfig.BRIDGE_PORT} =='\n")
-        append("(ss -ltnp 2>/dev/null || netstat -ltn 2>/dev/null) | grep ${BuildConfig.BRIDGE_PORT} || echo 'NO LISTENER'\n")
-        append("echo '== 2. server process =='\n")
-        append("pgrep -af 'server.mjs' || echo 'NO SERVER PROCESS'\n")
-        append("echo '== 3. authenticated health from Termux =='\n")
-        append("node \"\$ROOT/bridge/health-probe.mjs\" 2>&1 || echo 'PROBE FAILED'\n")
-        append("echo '== done =='\n")
-    }, false, tr("诊断本地服务连接"))
     fun openTerminal(context: Context, cwd: String) {
         val quote = "'" + cwd.replace("'", "'\\''") + "'"
         run(context, "cd -- $quote || exit\nexec \"\$PREFIX/bin/bash\" -l\n", false, tr("项目终端"))

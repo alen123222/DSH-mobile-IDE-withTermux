@@ -77,6 +77,44 @@ class TimelineTest {
         assertEquals(2, timeline.map { it.seq }.distinct().size)
     }
 
+    @Test fun reasoningBeforeTheFirstToolJoinsTheNewTurnIncludingOldRecords() {
+        for (explicit in listOf(false, true)) {
+            val data = JSONObject().put("text", "new turn reasoning")
+            if (explicit) data.put("turn", 3)
+            val timeline = buildTimeline(chat(true,
+                message("user", "previous"),
+                call(2, 1, "old", "bash", "ls"),
+                event("turn/end", JSONObject().put("turn", 2)),
+                message("assistant", "previous answer"),
+                message("user", "next"),
+                event("assistant/thinking", data),
+                call(3, 1, "new", "bash", "pwd"),
+                message("assistant", "done"),
+            ))
+            val work = timeline.filterIsInstance<Timeline.Work>()
+            assertEquals(2, work.size)
+            assertEquals("", work[0].thinking)
+            assertEquals(3, work[1].turn)
+            assertEquals("new turn reasoning", work[1].thinking)
+            assertEquals("new", work[1].calls.single().callId)
+        }
+    }
+
+    @Test fun reasoningWithoutToolsStaysInItsUserInterval() {
+        val timeline = buildTimeline(chat(true,
+            message("user", "first"),
+            event("assistant/thinking", JSONObject().put("text", "first reasoning")),
+            message("assistant", "one"),
+            message("user", "second"),
+            event("assistant/thinking", JSONObject().put("text", "second reasoning")),
+            message("assistant", "two"),
+        ))
+        val work = timeline.filterIsInstance<Timeline.Work>()
+        assertEquals(2, work.size)
+        assertEquals("first reasoning", work[0].thinking)
+        assertEquals("second reasoning", work[1].thinking)
+    }
+
     @Test fun recordsWrittenBeforeNumberingStillGetUniqueRows() {
         val timeline = buildTimeline(chat(false,
             message("user", "hello"),

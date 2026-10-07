@@ -30,9 +30,9 @@ data class PocketState(
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
     val shortcuts: List<Shortcut> = emptyList(), val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
     val settings: EngineSettings = EngineSettings(), val error: String? = null, val viewer: OpenFile? = null,
-    val consent: Boolean = false, val terminalId: String? = null,
+    val terminalId: String? = null,
     val presets: List<ApiPreset> = emptyList(), val activePresetId: String = "",
-    val apiChecking: Boolean = false, val apiModels: List<String> = emptyList(), val apiResult: String = "",
+    val discovered: List<String> = emptyList(), val probing: Boolean = false,
 )
 
 class PocketModel(application: Application) : AndroidViewModel(application) {
@@ -51,29 +51,57 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     private var selectionRevision = 0
     private var browserRevision = 0
     private var browseCall: Job? = null
-    private var apiCheck: Job? = null
-    private var apiRevision = 0
-    private val providerClient = ProviderClient()
 
-    init { connect(false) }
+    init { PhoneControl.load(application); connect(false) }
+    /**
+     * Ask the configured endpoint which models it serves, so presets can be
+     * added from the real list instead of typed by hand.
+     */
+    fun probeModels(settings: EngineSettings) = task {
+        mutable.update { it.copy(probing = true, discovered = emptyList()) }
+        try {
+            val body = withContext(Dispatchers.IO) { api.call("providers/models", "POST", settings.json()) }
+            val items = body.objects("items").map { it.string("id") }.filter { it.isNotBlank() }.distinct()
+            mutable.update { it.copy(probing = false, discovered = items) }
+            if (items.isEmpty()) error(tr("这个地址没有返回模型列表"))
+        } catch (e: Exception) {
+            mutable.update { it.copy(probing = false, discovered = emptyList()) }
+            error(e.message ?: tr("无法获取模型列表"))
+        }
+    }
+    fun clearDiscovered() = mutable.update { it.copy(discovered = emptyList()) }
+    /**
+     * Where each transcript was left. The list state lives in the composition, so
+     * without this a tab switch or a rotation dropped the reader back at the top.
+     */
+    private val transcriptPositions = mutableMapOf<String, Pair<Int, Int>>()
+    fun transcriptPosition(id: String): Pair<Int, Int>? = transcriptPositions[id]
+    fun rememberTranscriptPosition(id: String, index: Int, offset: Int) {
+        transcriptPositions[id] = index to offset
+    }
+    /** One preset per model: the chat page's picker lists exactly these. */
+    fun addPresetsFor(ids: List<String>, template: EngineSettings): Int {
+        var added = 0
+        for (id in ids) if (savePreset(null, id, template.copy(model = id))) added++
+        return added
+    }
     fun dismissError() = mutable.update { it.copy(error = null) }
     fun error(message: String) = mutable.update { it.copy(error = message) }
-    fun consent(value: Boolean) = mutable.update { it.copy(consent = value) }
-    fun savePreset(id: String?, name: String, settings: EngineSettings) {
+    fun savePreset(id: String?, name: String, settings: EngineSettings): Boolean {
         try {
             ProviderEndpoint.base(settings)
             require(name.isNotBlank() && settings.model.isNotBlank()) { tr("请填写预设名称和模型 ID") }
             val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route))
-            val items = state.value.presets.filterNot { it.id == preset.id } + preset
+            val items = if (state.value.presets.any { it.id == preset.id })
+                state.value.presets.map { if (it.id == preset.id) preset else it } else state.value.presets + preset
             secrets.savePresets(preset.id, items)
-            invalidateApiCheck()
-            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings, apiResult = tr("已保存并启用；下一条消息生效。")) }
-        } catch (e: Exception) { error(e.message ?: tr("保存失败")) }
+            mutable.update { it.copy(presets = items, activePresetId = preset.id, settings = preset.settings) }
+            return true
+        } catch (e: Exception) { error(e.message ?: tr("保存失败")); return false }
     }
     fun selectPreset(id: String) {
         val preset = state.value.presets.firstOrNull { it.id == id } ?: return
         secrets.savePresets(id, state.value.presets)
-        invalidateApiCheck()
         mutable.update { it.copy(activePresetId = id, settings = preset.settings) }
     }
     fun deletePreset(id: String) {
@@ -81,41 +109,13 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         if (items.isEmpty()) { error(tr("请至少保留一个预设")); return }
         val active = items.firstOrNull { it.id == state.value.activePresetId } ?: items.first()
         secrets.savePresets(active.id, items)
-        invalidateApiCheck()
         mutable.update { it.copy(presets = items, activePresetId = active.id, settings = active.settings) }
     }
-    fun invalidateApiCheck() {
-        apiRevision++
-        apiCheck?.cancel()
-        mutable.update { it.copy(apiChecking = false, apiModels = emptyList(), apiResult = "") }
-    }
-    fun checkApi(settings: EngineSettings, listModels: Boolean) {
-        val revision = ++apiRevision
-        apiCheck?.cancel()
-        mutable.update { it.copy(apiChecking = true, apiResult = if (listModels) tr("正在查询模型…") else tr("正在发送简短测试请求…"), apiModels = emptyList()) }
-        apiCheck = viewModelScope.launch {
-            try {
-                if (listModels) {
-                    val models = withContext(Dispatchers.IO) { providerClient.models(settings) }
-                    if (revision == apiRevision) mutable.update { it.copy(apiModels = models, apiResult = tr("发现 ") + models.size + tr(" 个模型。列表不代表每个模型均可调用，请选择后测试。")) }
-                } else {
-                    val result = withContext(Dispatchers.IO) { providerClient.test(settings) }
-                    if (revision == apiRevision) mutable.update { it.copy(apiResult = result) }
-                }
-            } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (revision == apiRevision) mutable.update { it.copy(apiResult = (e.message ?: tr("测试失败")).let { message -> if (settings.apiKey.isNotEmpty()) message.replace(settings.apiKey, tr("[已隐藏]")) else message }) } }
-            finally { if (revision == apiRevision) mutable.update { it.copy(apiChecking = false) } }
-        }
-    }
-    /** The address actually in use, so a loopback workaround stays visible. */
-    fun bridgeAddress(): String = api.address()
-
-    // Verbatim transport diagnostics. Termux can prove the service is healthy
-    // while the app still cannot reach it, and guessing between the possible
-    // causes has been wrong twice; this reports what the app really observes.
-    fun probeReport(onDone: (String) -> Unit) = viewModelScope.launch {
-        val report = withContext(Dispatchers.IO) { api.probeReport() }
-        onDone(report)
+    fun selectReasoning(effort: String) {
+        val current = state.value
+        if (effort !in reasoningLevels(current.settings.protocol)) return
+        val preset = current.presets.firstOrNull { it.id == current.activePresetId } ?: return
+        savePreset(preset.id, preset.name, current.settings.copy(reasoningEffort = effort))
     }
 
     fun connect(start: Boolean = true) {
@@ -187,7 +187,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     fun select(workspace: Workspace) {
         selectionRevision++
         stopMonitor()
-        mutable.update { it.copy(selected = workspace, chat = null, chats = emptyList(), terminalId = null, consent = false, entries = emptyList(), browserPath = workspace.path) }
+        mutable.update { it.copy(selected = workspace, chat = null, chats = emptyList(), terminalId = null, entries = emptyList(), browserPath = workspace.path) }
         browse(workspace.path)
         val revision = selectionRevision
         task {
@@ -341,17 +341,18 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         val workspace = state.value.selected ?: return@task
         val value = withContext(Dispatchers.IO) { api.call("chats", "POST", JSONObject().put("workspaceId", workspace.id)) }
         if (state.value.selected?.id != workspace.id) return@task
-        mutable.update { it.copy(chat = value, chats = listOf(value) + it.chats, consent = false) }
+        mutable.update { it.copy(chat = value, chats = listOf(value) + it.chats) }
         monitor(value.getString("id"))
     }
     fun openChat(id: String) = task {
         val workspaceId = state.value.selected?.id
         val value = withContext(Dispatchers.IO) { api.call("chats/$id") }
         if (value.string("workspaceId") != workspaceId || workspaceId != state.value.selected?.id) return@task
-        mutable.update { it.copy(chat = value, consent = false) }
+        mutable.update { it.copy(chat = value) }
         monitor(id)
     }
     private fun stopMonitor() {
+        PhoneControl.toggle(false)
         monitorRevision++
         streaming = null
         monitor?.cancel()
@@ -362,6 +363,31 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         stopMonitor()
         super.onCleared()
     }
+    /**
+     * Snapshots reach the UI over three channels: the event stream, the poll, and
+     * the acknowledgement that `prompt` returns at enqueue time. That last one is
+     * older than what the stream may already have delivered, so installing it
+     * blindly made the transcript jump backwards. Accept a snapshot only for the
+     * chat on screen and only when its revision does not go back.
+     */
+    private var lastStatus: String? = null
+    /**
+     * The run is over, successfully or not: stop claiming to work and put DSH back
+     * in front, so the result is what the user sees next.
+     */
+    private fun trackRun(chat: JSONObject) {
+        val status = chat.string("status")
+        val previous = lastStatus
+        lastStatus = status
+        if (previous != "running" || status == "running") return
+        val context = getApplication<Application>()
+        PhoneControl.clearWorking(context)
+        if (PhoneControl.enabled.value) PhoneControl.returnToApp(context)
+    }
+    private fun accepts(current: JSONObject?, incoming: JSONObject): Boolean =
+        current == null || (current.string("id") == incoming.string("id") &&
+            incoming.optLong("revision", 0) >= current.optLong("revision", 0))
+
     private fun monitor(id: String) {
         stopMonitor()
         streaming = id
@@ -375,7 +401,11 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                     val since = state.value.chat?.optInt("revision", -1) ?: -1
                     val chat = withContext(Dispatchers.IO) { api.call("chats/$id", query = mapOf("since" to since.toString())) }
                     if (streaming != id || revision != monitorRevision) return@launch
-                    mutable.update { it.copy(connected = true, chat = if (chat.optBoolean("unchanged")) it.chat else chat) }
+                    mutable.update { state ->
+                        val next = if (chat.optBoolean("unchanged") || !accepts(state.chat, chat)) state.chat else chat
+                        state.copy(connected = true, chat = next)
+                    }
+                    if (!chat.optBoolean("unchanged")) trackRun(chat)
                 } catch (e: CancellationException) { throw e }
                 catch (e: Exception) {
                     mutable.update { it.copy(connected = false) }
@@ -389,11 +419,15 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             onFrame = { frame -> viewModelScope.launch {
                 if (streaming != id || revision != monitorRevision) return@launch
                 if (frame.deleted) {
-                    mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id }, chat = null, consent = false) }
+                    mutable.update { it.copy(chats = it.chats.filterNot { c -> c.string("id") == id }, chat = null) }
                     stopMonitor()
                 } else frame.chat?.let { chat ->
-                    mutable.update { state -> state.copy(chat = chat, connected = true,
-                        chats = state.chats.map { if (it.string("id") == id) chat else it }) }
+                    if (accepts(state.value.chat, chat) && state.value.chat?.string("status") == "running" && chat.string("status") != "running") PhoneControl.revoke()
+                    mutable.update { state ->
+                        if (!accepts(state.chat, chat)) state.copy(connected = true)
+                        else state.copy(chat = chat, connected = true,
+                            chats = state.chats.map { c -> if (c.string("id") == id) chat else c })
+                    }
                 }
             } },
             onClosed = {
@@ -406,19 +440,27 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         val state = state.value
         val chat = state.chat ?: return@task
         val settings = state.settings
+        val phone = PhoneControl.grant()
         val value = withContext(Dispatchers.IO) {
             api.call("chats/${chat.getString("id")}/prompt", "POST", JSONObject().put("prompt", prompt)
                 .put("model", settings.model).put("provider", settings.route).put("apiKey", settings.apiKey)
                 .put("protocol", settings.protocol).put("autoVersion", settings.autoVersion)
                 .put("contextWindow", settings.contextWindow).put("maxTokens", settings.maxTokens)
-                .put("baseUrl", settings.baseUrl).put("allowExecution", state.consent))
+                .put("reasoningEffort", settings.reasoningEffort)
+                .put("phone", phone).put("vision", settings.vision)
+                .put("baseUrl", settings.baseUrl).put("allowExecution", true))
         }
-        if (mutable.value.chat?.string("id") == value.string("id")) mutable.update { it.copy(chat = value) }
+        mutable.update { state -> if (accepts(state.chat, value)) state.copy(chat = value) else state }
+        // The accessibility service keeps a small overlay in front of whatever app it
+        // drives; nothing has to be pulled down to see that DSH is working.
     }
     fun stop() = task {
+        // Stopping kills the engine, so no turn/end will arrive to retract the notice.
+        PhoneControl.revoke()
+        PocketAccessibilityService.instance?.hideNotice()
         val id = state.value.chat?.string("id") ?: return@task
         val value = withContext(Dispatchers.IO) { api.call("chats/$id/stop", "POST") }
-        if (mutable.value.chat?.string("id") == id) mutable.update { it.copy(chat = value) }
+        mutable.update { state -> if (accepts(state.chat, value)) state.copy(chat = value) else state }
     }
     fun starChat(chat: JSONObject) = task {
         val id = chat.getString("id")
@@ -436,7 +478,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         val wasOpen = state.value.chat?.string("id") == id
         mutable.update { state -> state.copy(
             chats = state.chats.filterNot { it.string("id") == id },
-            chat = if (wasOpen) null else state.chat, consent = if (wasOpen) false else state.consent) }
+            chat = if (wasOpen) null else state.chat) }
         if (wasOpen) stopMonitor()
     }
     fun starWorkspace(workspace: Workspace) = task {
@@ -465,7 +507,6 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             entries = if (wasSelected) emptyList() else it.entries, browserPath = if (wasSelected) "" else it.browserPath,
             browserParent = if (wasSelected) "" else it.browserParent,
             browserLoading = if (wasSelected) false else it.browserLoading,
-            consent = if (wasSelected) false else it.consent,
             terminalId = if (wasSelected) null else it.terminalId) }
         if (wasSelected) state.value.workspaces.firstOrNull()?.let(::select)
     }

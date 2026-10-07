@@ -1,0 +1,4 @@
+<resources>
+    <string name="phone_control_description">DSH Pocket phone control: read the screen and perform actions only while enabled in chat, for apps you allow. You can stop control at any time.</string>
+    <string name="phone_control_label">DSH Pocket · Phone control</string>
+</resources>
