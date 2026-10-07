@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { ApiError, text, writeJson, readJson, executable, killProcessTree } from './util.mjs';
 import { connectionSettings, connectionSignature, writeProviderPatch } from './providers.mjs';
 import { t } from './i18n.mjs';
+import { ensureSdkSessionPatch } from '../termux/sdk-session-patch.mjs';
 
 // Matches DSH 0.2.0-rc.2's SDK protocol. Every process has one immutable cwd.
 // The SDK has no approval-response or cancel method; execution consent is
@@ -55,10 +56,26 @@ export class DshSessions {
    * conversation.
    */
   sequence(item) {
-    if (!Number.isInteger(item.seq)) item.seq = 0;
     const entries = [...(item.messages || []), ...(item.events || [])];
-    if (entries.every(entry => Number.isInteger(entry.seq))) return;
-    for (const entry of entries.sort((a, b) => (a.time || 0) - (b.time || 0))) entry.seq = ++item.seq;
+    const seen = new Set();
+    const intact = entries.every(entry => {
+      if (!Number.isInteger(entry.seq) || seen.has(entry.seq)) return false;
+      seen.add(entry.seq);
+      return true;
+    });
+    if (intact) {
+      // The counter itself was not written to disk, so a restart used to begin
+      // again at zero and collide with every sequence already on record. Resume
+      // above the highest one instead.
+      item.seq = Math.max(Number.isInteger(item.seq) ? item.seq : 0,
+        entries.reduce((max, entry) => Math.max(max, entry.seq), 0));
+      return;
+    }
+    // Missing or duplicated sequences: rebuild the whole order by time. It is
+    // deterministic, and it repairs a transcript written before the counter
+    // survived a restart.
+    item.seq = 0;
+    for (const entry of entries.slice().sort((a, b) => (a.time || 0) - (b.time || 0))) entry.seq = ++item.seq;
   }
   dshBin() {
     return this.options.dshBin || (fs.existsSync(path.join(this.stateDir, 'runtime', '.pocket-ready'))
@@ -123,8 +140,8 @@ export class DshSessions {
     return value;
   }
   snapshot(item) {
-    const { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error, starred } = item;
-    return { id, workspaceId, cwd, title, messages, events, status, revision, createdAt, error, starred: starred === true };
+    const { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred } = item;
+    return { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred: starred === true };
   }
   list(workspaceId) {
     return [...this.sessions.values()].filter(s => !workspaceId || s.workspaceId === workspaceId)
@@ -181,6 +198,7 @@ export class DshSessions {
   redact(item, value) {
     let result = String(value);
     if (item.apiKey) result = result.replaceAll(item.apiKey, '[redacted]');
+    if (item.phoneToken) result = result.replaceAll(item.phoneToken, '[redacted]');
     return result.slice(-8192);
   }
   request(item, method, params) {
@@ -197,11 +215,18 @@ export class DshSessions {
     });
   }
   async start(item, settings) {
+    const generationBeforeWait = item.generation;
+    if (item.retiring) await item.retiring;
+    if (!this.alive(item, generationBeforeWait) || item.status !== 'running') return;
     settings = connectionSettings(settings);
     const binary = this.dshBin();
     if (!binary) throw new ApiError(409, t('尚未安装 DSH，请先在环境页安装引擎'));
     if (process.platform === 'win32' && !this.options.command) throw new ApiError(501, t('此启动器面向 Termux；电脑端仅运行协议测试'));
+    const runtime = path.join(this.stateDir, 'runtime');
+    if (!this.options.command && path.resolve(binary) === path.join(runtime, 'bin', 'dsh-pocket')) ensureSdkSessionPatch(runtime);
     item.apiKey = settings.apiKey || '';
+    item.phoneToken = settings.phone?.token || '';
+    item.phonePort = settings.phone?.port || 0;
     item.stderr = '';
     item.notificationBuffer = [];
     item.receipt = null;
@@ -210,6 +235,12 @@ export class DshSessions {
     fs.mkdirSync(home, { recursive: true, mode: 0o700 });
     const env = { ...process.env, DSH_HOME: home };
     env.POCKET_API_KEY = item.apiKey;
+    if (settings.phone) {
+      env.POCKET_RUNTIME = runtime;
+      env.POCKET_PHONE_TOKEN = settings.phone.token;
+      env.POCKET_PHONE_PORT = String(settings.phone.port);
+      env.POCKET_PHONE_VISION = settings.vision ? '1' : '0';
+    }
     const [command, ...args] = this.options.command || [binary, '--profile', 'sdk-minimal'];
     args.push('--patch', writeProviderPatch(this.stateDir, item.id, settings));
     item.connectionSignature = connectionSignature(settings);
@@ -257,8 +288,14 @@ export class DshSessions {
       } catch (error) { this.fail(item, new Error(`DSH 协议解析失败：${error.message}`)); killProcessTree(child); }
     });
     const response = await this.request(item, 'initialize', { cwd: item.cwd,
-      provider: settings.provider, model: text(settings.model, t('模型名称'), 200), maxTokens: settings.maxTokens ?? 8192 });
+      provider: settings.provider, model: text(settings.model, t('模型名称'), 200), maxTokens: settings.maxTokens ?? 8192,
+      ...(settings.reasoningEffort ? { reasoningEffort: settings.reasoningEffort } : {}) });
     if (response?.serverInfo?.name !== 'deepseek-harness-sdk-runtime') throw new Error(t('DSH SDK 版本不兼容'));
+  }
+  phoneFinished(item) {
+    fetch('http://127.0.0.1:' + item.phonePort + '/phone', { method: 'POST',
+      headers: { Authorization: 'Bearer ' + item.phoneToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'finished' }), signal: AbortSignal.timeout(3000) }).catch(() => { /* Control may already be off. */ });
   }
   notification(item, frame) {
     const params = frame.params;
@@ -277,6 +314,12 @@ export class DshSessions {
       if (event.type === 'assistant/message') {
         const content = event.data?.message?.content;
         if (!Array.isArray(content)) throw new Error(t('无效的助手消息'));
+        const thinking = content
+          .filter(c => typeof c.text === 'string' && c.type !== 'text' && /think|reason/i.test(String(c.type)))
+          .map(c => c.text).join('\n').trim();
+        if (thinking) item.events.push({ type: 'assistant/thinking',
+          data: { turn: event.data.turn, step: event.data.step, text: clip(thinking, 8000) },
+          time: Date.now(), seq: ++item.seq });
         const value = content.filter(c => c.type === 'text').map(c => c.text).join('');
         if (value) {
           item.messages.push({ id: crypto.randomUUID(), role: 'assistant', text: value, time: Date.now(), seq: ++item.seq });
@@ -285,20 +328,15 @@ export class DshSessions {
           const limit = this.options.maxMessages ?? 500;
           if (item.messages.length > limit) item.messages.splice(0, item.messages.length - limit);
         }
-        // Reasoning rides along as a non-text part on the same message. Its exact
-        // type varies by model, so keep any textual part that is not plain text
-        // and looks like reasoning, and show it as the Thinking block.
-        const thinking = content
-          .filter(c => typeof c.text === 'string' && c.type !== 'text' && /think|reason/i.test(String(c.type)))
-          .map(c => c.text).join('\n').trim();
-        if (thinking) item.events.push({ type: 'assistant/thinking', data: { text: clip(thinking, 8000) },
-          time: Date.now(), seq: ++item.seq });
       }
       if (['tool/call', 'tool/result', 'turn/end', 'assistant/attempt'].includes(event.type)) {
         item.events.push({ type: event.type, data: summarizeEvent(event), time: Date.now(), seq: ++item.seq });
         if (item.events.length > (this.options.maxEvents ?? 300)) item.events.shift();
         if (event.type === 'turn/end' && event.data?.reason?.kind === 'error') item.error = this.redact(item, JSON.stringify(event.data.reason));
       }
+      // The turn is over, however it ended. Tell phone control so it can take its
+      // notice down and put the app back in front; the app itself may be gone.
+      if (event.type === 'turn/end' && item.phoneToken && item.phonePort) this.phoneFinished(item);
       if (event.type === 'assistant/message' || event.type.startsWith('tool/') || event.type === 'turn/end') this.touch(item);
     }
     if (frame.method === 'session.status' && params.status === 'idle' && item.consumed) {
@@ -357,6 +395,8 @@ export class DshSessions {
   stop(id) {
     const item = this.get(id);
     item.status = 'stopped'; this.touch(item);
+    // A stopped run never emits turn/end, so say so directly.
+    if (item.phoneToken && item.phonePort) this.phoneFinished(item);
     this.terminate(item);
     this.flush(item);
     return this.snapshot(item);
@@ -376,13 +416,22 @@ export class DshSessions {
     }
     item.pending.clear();
     item.apiKey = '';
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    killProcessTree(child);
+    if (!child || !child.pid || child.exitCode !== null || child.signalCode !== null) return;
+    // SDK shutdown disposes agents and flushes their JSONL history. Killing an
+    // idle runtime immediately can lose the assistant tail after its idle event.
+    // Replies from this retired generation are deliberately ignored above.
+    if (child.stdin.writable && !child.stdin.destroyed) {
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++item.requestId, method: 'shutdown', params: {} }) + '\n',
+        error => { if (error) killProcessTree(child); });
+    } else killProcessTree(child);
     const escalation = setTimeout(() => {
       try { if (child.exitCode === null && child.signalCode === null) killProcessTree(child, 'SIGKILL'); }
       catch { /* Already reaped. */ }
     }, 2500);
     escalation.unref();
+    // Keep the exit barrier even if resume/stop is called again with no child.
+    // A replacement must not race the previous process's durable write lease.
+    item.retiring = new Promise(resolve => child.once('exit', resolve));
     try { child.once('exit', () => clearTimeout(escalation)); } catch { /* Not an EventEmitter. */ }
   }
   // A stopped session used to be permanently unusable: prompt() demanded 'ready'

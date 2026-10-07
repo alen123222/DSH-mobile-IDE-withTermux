@@ -9,6 +9,7 @@ import { Workspaces } from './workspaces.mjs';
 import { Terminals } from './terminals.mjs';
 import { DshSessions } from './dsh.mjs';
 import { inLanguage, languageOf, t } from './i18n.mjs';
+import { connectionSettings, listModels } from './providers.mjs';
 
 // Server-Sent Events. The DSH session events already arrive live in dsh.mjs;
 // this only gives the phone a push channel instead of a 900 ms poll. The
@@ -71,7 +72,8 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       if (parts[0] !== 'v1') throw new ApiError(404, t('接口不存在'));
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
-      if (method === 'GET' && parts[1] === 'health') result = { version: '0.4.5', platform: process.platform, arch: process.arch,
+      if (method === 'POST' && parts[1] === 'providers' && parts[2] === 'models') result = await listModels(connectionSettings(body));
+      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.5.4', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
       else if (method === 'GET' && parts[1] === 'shortcuts') result = { items: await workspaces.shortcuts((url.searchParams.get('external') || '').split('\n')) };

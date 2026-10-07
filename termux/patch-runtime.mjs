@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { sdkSessionPatchPlan } from './sdk-session-patch.mjs';
 
 const runtime = path.resolve(process.argv[2]);
 const require = createRequire(path.join(runtime, 'package.json'));
@@ -30,6 +31,8 @@ const appBoot = packageDir('@deepseek-ai/dsh-app-boot');
 const nativeRequire = createRequire(path.join(subprocess, 'package.json'));
 const koffi = packageDir('koffi', nativeRequire), pty = packageDir('node-pty', nativeRequire);
 const plans = [];
+const sdkPlan = sdkSessionPatchPlan(runtime);
+if (sdkPlan.original !== sdkPlan.output) plans.push(sdkPlan);
 function replace(file, before, after) {
   const previousPlan = plans.find(p => p.file === file);
   const original = previousPlan?.original ?? fs.readFileSync(file, 'utf8');

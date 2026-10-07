@@ -24,6 +24,7 @@ if [ ! -f "$RUNTIME/.pocket-ready" ]; then
 fi
 
 echo '[3/6] Applying checked Android patches'
+node "$SCRIPTS/ensure-images.mjs" "$RUNTIME"
 node "$SCRIPTS/patch-runtime.mjs" "$RUNTIME"
 get_path() { node -e 'console.log(require(process.argv[1])[process.argv[2]])' "$RUNTIME/native-paths.json" "$1"; }
 PTY="$(get_path pty)"

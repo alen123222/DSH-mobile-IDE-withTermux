@@ -97,6 +97,38 @@ test('changing the model on an idle chat continues it in place', async t => {
   assert.match(result.messages.at(-1).text, /second$/);
 });
 
+test('a restarted bridge never reuses a sequence', async t => {
+  const { request, projects, bridge } = await setup(t);
+  const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
+  const chat = (await request('chats', { method: 'POST', body: { workspaceId: workspace.id } })).body;
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'first', model: 'test', allowExecution: true } });
+  await waitChat(request, chat.id, c => c.status === 'ready');
+  const item = bridge.chats.get(chat.id);
+  const entries = () => [...item.messages, ...item.events];
+  const before = Math.max(...entries().map(entry => entry.seq));
+  // A restart used to reload the file without the counter and renumber from zero.
+  delete item.seq;
+  bridge.chats.sequence(item);
+  assert.ok(item.seq >= before, 'the counter resumes above the highest sequence on record');
+  await request(`chats/${chat.id}/prompt`, { method: 'POST', body: { prompt: 'second', model: 'test', allowExecution: true } });
+  await waitChat(request, chat.id, c => c.status === 'ready');
+  const seqs = entries().map(entry => entry.seq);
+  assert.equal(new Set(seqs).size, seqs.length, 'sequences stay unique across a restart');
+});
+
+test('a damaged transcript is rebuilt in time order', async t => {
+  const { bridge } = await setup(t);
+  const item = { seq: 0, messages: [
+    { role: 'user', text: 'later', time: 200, seq: 1 },
+    { role: 'assistant', text: 'earlier', time: 100, seq: 1 },
+  ], events: [] };
+  bridge.chats.sequence(item);
+  // The arrays keep their own order; the sequence is what the client sorts by.
+  const ordered = [...item.messages].sort((a, b) => a.seq - b.seq).map(message => message.text);
+  assert.deepEqual(ordered, ['earlier', 'later']);
+  assert.deepEqual([...item.messages].map(message => message.seq).sort((a, b) => a - b), [1, 2]);
+});
+
 test('the transcript is ordered and tool arguments are stored as text', async t => {
   const { request, projects, bridge } = await setup(t);
   const workspace = (await request('workspaces', { method: 'POST', body: { path: projects[0] } })).body;
@@ -113,6 +145,25 @@ test('the transcript is ordered and tool arguments are stored as text', async t 
   assert.equal(typeof call.data.name, 'string');
   assert.equal(typeof call.data.arguments, 'string', 'arguments are normalised to text for the UI');
   assert.ok(item.events.some(e => e.type === 'turn/end'));
+});
+
+test('reasoning retains its engine turn and precedes the visible answer', async t => {
+  const { bridge, projects } = await setup(t);
+  const chat = bridge.chats.create({ id: 'workspace', path: projects[0] });
+  const item = bridge.chats.get(chat.id);
+  item.status = 'running';
+  item.receipt = 'receipt';
+  item.consumed = true;
+  bridge.chats.notification(item, { method: 'session.event', params: { sessionId: chat.id,
+    event: { type: 'assistant/message', data: { turn: 3, step: 1, message: { content: [
+      { type: 'reasoning', text: 'Inspect the files first.' }, { type: 'text', text: 'Answer' },
+    ] } } } } });
+  assert.deepEqual(item.events[0].data, { turn: 3, step: 1, text: 'Inspect the files first.' });
+  assert.ok(item.events[0].seq < item.messages[0].seq);
+  bridge.chats.notification(item, { method: 'session.event', params: { sessionId: chat.id,
+    event: { type: 'assistant/message', data: { turn: 3, step: 2,
+      message: { content: [{ type: 'tool-call', id: 'call' }] } } } } });
+  assert.equal(item.events.length, 1, 'no reasoning is invented for a tool-only reply');
 });
 
 test('bridge messages follow the Accept-Language header', async t => {

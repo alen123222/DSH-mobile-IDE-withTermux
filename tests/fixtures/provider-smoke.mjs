@@ -9,6 +9,8 @@ import { once } from 'node:events';
 
 const home = process.env.POCKET_HOME || path.join(os.homedir(), '.local/share/dsh-pocket');
 let requests = 0, toolRequests = 0;
+const checkReasoning = process.argv.includes('--reasoning');
+let expectedEffort = 'high';
 const marker = 'POCKET_CUSTOM_ADAPTER_OK';
 const server = http.createServer(async (req, res) => {
   try {
@@ -35,6 +37,7 @@ const server = http.createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     assert.equal(body.model, 'pocket-test-model');
+    if (checkReasoning) assert.equal(body.reasoning_effort, expectedEffort);
     requests++;
     if (!body.stream) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -73,7 +76,8 @@ if (process.argv.includes('--serve')) {
   let passed = false;
   try {
     await sessions.prompt(chat.id, { prompt: 'Use Bash to write and read the test marker.', model: 'pocket-test-model', protocol: 'openai-chat',
-      apiKey: 'pocket-smoke-fake-key', baseUrl: `http://127.0.0.1:${server.address().port}/v1/chat/completions`, allowExecution: true });
+      apiKey: 'pocket-smoke-fake-key', baseUrl: `http://127.0.0.1:${server.address().port}/v1/chat/completions`, allowExecution: true,
+      reasoningEffort: checkReasoning ? 'high' : '' });
     const deadline = Date.now() + 60000;
     while (sessions.get(chat.id).status === 'running' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200));
     const result = sessions.snapshot(sessions.get(chat.id));
@@ -83,6 +87,16 @@ if (process.argv.includes('--serve')) {
     assert.ok(requests >= 2 && toolRequests === 1);
     assert.ok(result.events.some(e => e.type === 'tool/result'));
     assert.equal(JSON.stringify(result).includes('pocket-smoke-fake-key'), false);
+    if (checkReasoning) for (const effort of ['low', 'off']) {
+      expectedEffort = effort === 'off' ? 'none' : effort;
+      await sessions.prompt(chat.id, { prompt: 'Reply with the marker again.', model: 'pocket-test-model', protocol: 'openai-chat',
+        apiKey: 'pocket-smoke-fake-key', baseUrl: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
+        allowExecution: true, reasoningEffort: effort });
+      const until = Date.now() + 60000;
+      while (sessions.get(chat.id).status === 'running' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 200));
+      assert.equal(sessions.get(chat.id).status, 'ready', sessions.get(chat.id).error);
+      assert.equal(sessions.get(chat.id).messages.at(-1)?.text, marker);
+    }
     console.log(JSON.stringify({ passed: true, protocol: 'openai-chat', requests, toolRequests, assistant: marker, realFileWrite: true }));
     passed = true;
   } finally {
