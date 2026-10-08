@@ -230,6 +230,46 @@ $env:ANDROID_USER_HOME = Join-Path (Get-Location) '.cache\android'
 
 产物位于 `app/build/outputs/apk/debug/app-debug.apk`。安装后桥接资产会在版本号变化时自动同步到 Termux。
 
+## 发布新版本
+
+一次发布要改三处版本号，缺一处就会"改了没生效"：
+
+| 位置 | 何时必须改 |
+| --- | --- |
+| `app/build.gradle.kts` 的 `versionCode` / `versionName` | 每次发布 |
+| `app/src/main/java/dev/dsh/pocket/BridgeApi.kt` 的 `BRIDGE_VERSION` | **改动了 `bridge/` 或 `termux/` 时**，且必须与下一项一致 |
+| `bridge/server.mjs` 健康检查返回的 `version` | 同上 |
+
+桥接资产只在健康检查版本号变化时同步到 Termux。这两处不一致，改动就不会生效，症状是出现「接口不存在」这类本不该有的错误。
+
+构建：
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Java\jdk-17'
+.\gradlew.bat --no-daemon :app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :app:lintDebug
+```
+
+产物在 `app/build/outputs/apk/{debug,release}/`。release 使用项目自带 keystore 签名，因此可以和 debug 版互相覆盖安装；它不含调试夹具且不可调试。换正式签名前请注意：换签名等于换应用，无法覆盖安装，数据会清空。
+
+**用 Release 附件发布，不要把 APK 提交进 git。** `artifacts/` 与 `*.apk` 都在 `.gitignore` 里，这是有意的：二进制一旦进入历史就永远删不掉，此后每次克隆都要下载全部历史版本。
+
+```powershell
+$tag = 'v0.6.2'
+$nl = [string][char]10
+$cred = ('protocol=https' + $nl + 'host=github.com' + $nl + $nl) | git credential fill
+$token = ($cred | Where-Object { $_ -like 'password=*' }).ToString().Substring(9)
+$h = @{ Authorization = 'token ' + $token; Accept = 'application/vnd.github+json'; 'User-Agent' = 'dsh-pocket-build' }
+$api = 'https://api.github.com/repos/alen123222/DSH-mobile-IDE-withTermux'
+$body = @{ tag_name = $tag; name = "DSH Pocket $tag"; body = '版本说明' } | ConvertTo-Json
+$rel = Invoke-RestMethod -Method Post -Uri ($api + '/releases') -Headers $h -Body $body -ContentType 'application/json'
+foreach ($f in @('artifacts\apk\dsh-pocket-0.6.2-release.apk', 'artifacts\apk\dsh-pocket-0.6.2-debug.apk')) {
+    Invoke-RestMethod -Method Post -Headers $h -InFile $f -ContentType 'application/vnd.android.package-archive' `
+        -Uri ('https://uploads.github.com/repos/alen123222/DSH-mobile-IDE-withTermux/releases/' + $rel.id + '/assets?name=' + (Split-Path $f -Leaf))
+}
+```
+
+发布说明里要如实写出尚未验证的部分：真机装一次，并在设备上的 Termux 运行一次 `node --test`——Windows 无法创建管道，Node 回归只能在设备上跑。
+
 ## 测试与验证
 
 | 层次 | 方式 |
