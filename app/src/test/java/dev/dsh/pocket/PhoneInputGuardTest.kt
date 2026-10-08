@@ -4,17 +4,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PhoneInputGuardTest {
-    @Test fun alternatingTapAndTypeCannotBypassFailureLimit() {
+    @Test fun alternatingTapAndTypeCannotBypassTheTypingLimit() {
         val guard = PhoneInputGuard()
         guard.inputResult(false)
         assertNotNull(guard.blocked("tap"))
         assertNull(guard.blocked("screenshot"))
         guard.observed()
+        // A tap between failed inputs must not reset the count.
         assertNull(guard.blocked("tap"))
         guard.inputResult(false)
         guard.observed()
-        assertNotNull(guard.blocked("tap"))
+        assertNull(guard.blocked("type"))
+        guard.inputResult(false)
+        guard.observed()
+        // Three failures stop typing, and only typing: the model can still recover.
         assertNotNull(guard.blocked("type"))
+        assertNull(guard.blocked("tap"))
         assertNull(guard.blocked("finished"))
         guard.reset()
         assertNull(guard.blocked("type"))

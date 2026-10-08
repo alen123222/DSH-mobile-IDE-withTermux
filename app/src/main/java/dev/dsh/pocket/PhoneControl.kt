@@ -55,18 +55,21 @@ object PhoneControl {
     fun openSettings(context: Context) = context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
 
     /**
-     * A request gets a fixed number of actions, and the same action repeated three
-     * times in a row ends it. Without this a model that cannot see any progress
-     * retries until the user stops it, which is how a five-minute turn happens.
+     * A request gets a generous but finite number of actions. The repeat rule only
+     * covers actions that change something: observing twice in a row is how a model
+     * waits for a screen to settle, and counting that as a runaway cut real runs short.
+     * A model that cannot make progress still gets stopped before the user has to.
      */
-    private val budget = 45
+    private val budget = 120
+    private val readOnly = setOf("observe", "screenshot", "state")
     @Volatile private var spent = 0
     @Volatile private var lastAction = ""
     @Volatile private var repeats = 0
-    fun spend(signature: String): String? {
+    fun spend(action: String, args: JSONObject): String? {
         if (++spent > budget) return "Phone control has used its $budget actions for this request; stop and report what you have so far."
-        if (signature == lastAction && ++repeats >= 2) {
-            return "The same action was tried three times in a row; it is not working. Stop and tell the user what is blocking it."
+        val signature = action + " " + args.toString()
+        if (action !in readOnly && signature == lastAction && ++repeats >= 4) {
+            return "The same action was tried four times in a row with nothing changing; stop and tell the user what is blocking it."
         }
         if (signature != lastAction) { lastAction = signature; repeats = 0 }
         return null

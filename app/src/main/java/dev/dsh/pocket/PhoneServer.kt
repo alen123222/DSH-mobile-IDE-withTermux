@@ -131,7 +131,7 @@ class PhoneServer(
                     finish(JSONObject().put("ok", false).put("error", message)); return@post
                 }
                 if (action != "finished") onNotice(tr("DSH 正在工作") + " · " + action)
-                (if (action == "finished") null else PhoneControl.spend(action + " " + args.toString())).let { stop ->
+                (if (action == "finished") null else PhoneControl.spend(action, args)).let { stop ->
                     if (stop != null) { finish(JSONObject().put("ok", false).put("error", stop)); return@post }
                 }
                 when (action) {

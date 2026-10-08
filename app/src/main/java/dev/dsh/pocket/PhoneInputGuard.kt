@@ -12,7 +12,11 @@ class PhoneInputGuard {
     }
     fun blocked(action: String): String? {
         if (action in setOf("state", "observe", "screenshot", "finished")) return null
-        if (failures >= 2) return "Phone input failed twice. Further actions are disabled for this request. Stop and report the input error; do not retry taps or typing."
+        // Only typing is stopped: a field that keeps refusing text is the runaway, and
+        // locking the whole phone after two attempts left models unable to recover.
+        if (action == "type" && failures >= 3) {
+            return "Typing failed $failures times. Stop typing and report the input error; open the field again, use the app's own search, or tell the user."
+        }
         if (needsObservation) return "Obtain a successful phone_observe or phone_screenshot to check the input result before any further action."
         return null
     }
