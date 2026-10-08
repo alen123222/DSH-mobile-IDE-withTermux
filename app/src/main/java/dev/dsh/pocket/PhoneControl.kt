@@ -18,6 +18,8 @@ import java.util.UUID
 object PhoneControl {
     val inputGuard = PhoneInputGuard()
     val connected = MutableStateFlow(false)
+    /** The Shizuku-only endpoint is serving, which happens when accessibility is off. */
+    val standalone = MutableStateFlow(false)
     val enabled = MutableStateFlow(false)
     @Volatile private var token = ""
     @Volatile private var expires = 0L

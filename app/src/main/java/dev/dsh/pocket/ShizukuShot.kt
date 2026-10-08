@@ -93,6 +93,16 @@ object ShizukuShot {
         }
     }
 
+    /** Runs a command as the shell user. Output must be redirected to a file. */
+    fun run(command: String): Boolean = try { service?.run(command) ?: false } catch (_: Throwable) { false }
+
+    /** Where the shell user may write files this app then reads. */
+    fun scratch(context: Context, name: String): File {
+        val dir = context.getExternalFilesDir(null)
+        dir?.mkdirs()
+        return File(dir, name)
+    }
+
     /**
      * Captures into this app's own external files directory: the shell user can write
      * there, and reading the file back avoids pushing megabytes through binder.

@@ -52,6 +52,16 @@ fun PhoneControlPane() {
         }
         if (!shizuku) Text(tr("Shizuku 是可选的：运行它之后，截图改由 shell 用户执行，不再受「只能有一个窗口」和空白界面树的限制。"),
             style = MaterialTheme.typography.bodySmall)
+        // Accessibility is normally what hosts the phone endpoint. With Shizuku alone a
+        // foreground service takes that over, at the price of typing.
+        val standalone by PhoneControl.standalone.collectAsState()
+        if (shizuku && !connected) {
+            OutlinedButton(onClick = {
+                if (standalone) PhoneStandaloneService.stop(context) else PhoneStandaloneService.start(context)
+            }) { Text(if (standalone) tr("停止无无障碍模式") else tr("不开无障碍也能用（Shizuku）")) }
+            Text(tr("该模式用 shell 驱动手机：可读界面、点击、滚动、返回、开应用、截图，但只能输入英文（shell 无法输入中文）。"),
+                style = MaterialTheme.typography.bodySmall)
+        }
         TextButton(onClick = { expanded = !expanded }) { Text("允许的应用 · ${allowed.size} ▾") }
         if (expanded) Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
             apps.forEach { (pkg, label) ->

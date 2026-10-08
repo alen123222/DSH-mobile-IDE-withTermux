@@ -1,15 +1,17 @@
 package dev.dsh.pocket
 
 /**
- * The Shizuku user service. This class is instantiated by Shizuku inside a process that
- * runs as the shell user, so the command below is not subject to the app's own limits.
+ * The Shizuku user service. Shizuku instantiates this inside a process running as the
+ * shell user, so the commands below are not subject to the app's own limits.
  */
 class ShotService : IShotService.Stub() {
-    override fun screencap(path: String): Boolean = try {
-        val process = ProcessBuilder("sh", "-c", "screencap -p '" + path.replace("'", "'\\''") + "' && chmod 644 '" + path.replace("'", "'\\''") + "'")
-            .redirectErrorStream(true)
-            .start()
-        val finished = process.waitFor()
-        finished == 0
+    override fun screencap(path: String): Boolean = exec("screencap -p " + quote(path) + " && chmod 644 " + quote(path))
+
+    override fun run(command: String): Boolean = exec(command)
+
+    private fun exec(command: String): Boolean = try {
+        ProcessBuilder("sh", "-c", command).redirectErrorStream(true).start().waitFor() == 0
     } catch (_: Throwable) { false }
+
+    private fun quote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 }

@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <queries><package android:name="com.termux" /><intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent></queries>
     <application android:theme="@style/AppTheme" android:label="${pocketLabel}"
         android:icon="@drawable/ic_launcher" android:allowBackup="false"
@@ -29,6 +31,12 @@
              reachable from other apps and holds no state. -->
         <!-- Shizuku instantiates this class itself, so it is a binder rather than a
              Service; the Instantiatable check does not apply to user services. -->
+        <!-- Hosts the phone endpoint when accessibility is unavailable, so the model
+             can keep working in other apps while this service keeps the app alive. -->
+        <service android:name=".PhoneStandaloneService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="phone-control" />
+        </service>
         <service android:name=".ShotService" android:exported="false" android:process=":shot"
             tools:ignore="Instantiatable" />
         <!-- Shizuku hands the binder to the app through this provider. Without it

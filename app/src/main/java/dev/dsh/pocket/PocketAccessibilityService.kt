@@ -41,7 +41,21 @@ class PocketAccessibilityService : AccessibilityService() {
     }
     private val main = Handler(Looper.getMainLooper())
     private val revision = AtomicLong(0)
-    @Volatile private var server: ServerSocket? = null
+    /** The endpoint the bridge talks to. Each action comes back here to be performed. */
+    private val phoneServer by lazy {
+        PhoneServer(
+            dispatch = ::dispatch,
+            onNotice = { text -> if (text != null) showPill(text) else hidePill() },
+            onFinished = {
+                // Only pull the app forward if this run really drove the phone; a turn
+                // that never touched it should not steal focus back.
+                val wasDriving = pill != null
+                hidePill()
+                if (wasDriving) PhoneControl.returnToApp(this)
+            },
+            onState = { PhoneControl.connected.value = it },
+        )
+    }
 
     override fun onServiceConnected() {
         PhoneControl.load(this)
@@ -58,25 +72,11 @@ class PocketAccessibilityService : AccessibilityService() {
         // service that was plainly answering. Only the thread that owns the socket
         // may publish its state, and only while it is still the current one.
         synchronized(this) {
-            val current = server
-            if (current != null && !current.isClosed) { PhoneControl.connected.value = true; return }
-            val listener = try {
-                ServerSocket(BuildConfig.BRIDGE_PORT + 1, 4, InetAddress.getByName("127.0.0.1"))
-            } catch (_: Exception) {
-                PhoneControl.connected.value = false
-                return
-            }
-            server = listener
+            // A second call for an already bound service is a no-op in the server. The
+            // old code failed to bind a second time and reported the service as
+            // disconnected while the first socket was plainly answering.
             instance = this
-            PhoneControl.connected.value = true
-            Thread({
-                try { while (!listener.isClosed) try { listener.accept().use(::serve) } catch (_: Exception) { } }
-                finally {
-                    synchronized(this) {
-                        if (server === listener) { server = null; PhoneControl.connected.value = false }
-                    }
-                }
-            }, "pocket-phone").start()
+            phoneServer.start()
         }
     }
 
@@ -86,7 +86,7 @@ class PocketAccessibilityService : AccessibilityService() {
         PhoneControl.revoke(); PhoneControl.connected.value = false
         if (instance === this) instance = null
         hidePill()
-        server?.close(); super.onDestroy()
+        phoneServer.stop(); super.onDestroy()
     }
 
     // ---- always-visible work notice ------------------------------------------
@@ -146,114 +146,36 @@ class PocketAccessibilityService : AccessibilityService() {
 
     // ---- transport -----------------------------------------------------------
 
-    private fun line(input: java.io.InputStream): String {
-        val out = ByteArrayOutputStream()
-        while (out.size() < 8192) {
-            val c = input.read(); check(c >= 0) { "Incomplete request" }
-            if (c == 10) return out.toString("US-ASCII").trimEnd('\r')
-            out.write(c)
-        }
-        error("Header too long")
-    }
-
-    private fun serve(socket: Socket) {
-        socket.soTimeout = 3000
-        var status = 200
-        val result = try {
-            val input = socket.getInputStream()
-            check(line(input) == "POST /phone HTTP/1.1") { "Unsupported request" }
-            val headers = mutableMapOf<String, String>()
-            var total = 0
-            while (true) {
-                val value = line(input); total += value.length
-                check(total <= 16384) { "Headers too large" }
-                if (value.isEmpty()) break
-                val split = value.indexOf(':'); check(split > 0)
-                headers[value.substring(0, split).lowercase()] = value.substring(split + 1).trim()
-            }
-            val credential = headers["authorization"].orEmpty().removePrefix("Bearer ")
-            if (!PhoneControl.authorized(credential)) { status = 403; error("Phone control is disabled or expired") }
-            check(!headers.containsKey("transfer-encoding"))
-            val length = headers["content-length"]?.toIntOrNull() ?: 0
-            check(length in 2..32768) { "Invalid body size" }
-            val bytes = ByteArray(length)
-            var offset = 0
-            while (offset < length) { val count = input.read(bytes, offset, length - offset); check(count > 0); offset += count }
-            execute(JSONObject(String(bytes, Charsets.UTF_8)), credential)
-        } catch (e: Exception) { JSONObject().put("ok", false).put("error", e.message ?: "Phone operation failed") }
-        val body = result.toString().toByteArray(Charsets.UTF_8)
-        socket.getOutputStream().apply {
-            write("HTTP/1.1 $status OK\r\nContent-Type: application/json\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray())
-            write(body); flush()
-        }
-    }
-
-    /** One action at a time, on the main thread, with a hard deadline. */
-    private fun execute(args: JSONObject, credential: String): JSONObject {
-        val done = CountDownLatch(1)
-        var result = JSONObject().put("ok", false).put("error", "Operation timed out")
-        var attemptedInput = false
-        val finish: (JSONObject) -> Unit = {
-            if (attemptedInput) {
-                PhoneControl.inputGuard.inputResult(it.optBoolean("ok"))
-                if (!it.optBoolean("ok")) it.put("recovery", PhoneControl.inputGuard.blocked("type"))
-            }
-            if (it.optBoolean("ok") && (it.has("imageBase64") || it.optInt("count") > 0)) {
-                PhoneControl.inputGuard.observed()
-            }
-            result = it; done.countDown()
-        }
-        main.post {
-            try {
-                check(PhoneControl.authorized(credential)) { "Control revoked" }
-                val action = args.getString("action")
-                PhoneControl.inputGuard.blocked(action)?.let { message ->
-                    finish(JSONObject().put("ok", false).put("error", message)); return@post
-                }
-                if (action != "finished") showPill(tr("DSH 正在工作") + " · " + action)
-                (if (action == "finished") null else PhoneControl.spend(action + " " + args.toString())).let { stop ->
-                    if (stop != null) { finish(JSONObject().put("ok", false).put("error", stop)); return@post }
-                }
-                when (action) {
-                    // The bridge says the turn is over: this is the only reliable end
-                    // signal, because the app may have been reclaimed while it was in
-                    // the background and cannot be trusted to notice the transition.
-                    "finished" -> {
-                        // Only pull the app forward if this run really drove the phone;
-                        // a turn that never touched it should not steal focus back.
-                        val wasDriving = pill != null
-                        hidePill()
-                        if (wasDriving) PhoneControl.returnToApp(this)
-                        finish(JSONObject().put("ok", true))
-                    }
-                    "state" -> finish(JSONObject().put("ok", true).put("apps", JSONArray(PhoneControl.allowed.toList()))
-                        .put("shizuku", ShizukuShot.granted.value)
-                        .put("preciseScreenshot", ShizukuShot.granted.value))
-                    "launch" -> finish(launch(args))
-                    "screenshot" -> capture(credential, finish)
-                    else -> {
-                        val root = rootInActiveWindow ?: error("No active window; unlock the device")
-                        val pkg = root.packageName?.toString().orEmpty()
-                        check(pkg in PhoneControl.allowed) { "Foreground app is not allowed: $pkg" }
-                        when (action) {
-                            "observe" -> finish(observe(root, pkg))
-                            "tap" -> tap(root, args, finish)
-                            "type" -> { attemptedInput = true; finish(type(root, args)) }
-                            "scroll" -> scroll(args, finish)
-                            "key" -> {
-                                val key = args.getString("key")
-                                check(key == "back" || key == "home") { "Only back/home are supported" }
-                                val ok = performGlobalAction(if (key == "back") GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
-                                finish(JSONObject().put("ok", ok).apply { if (!ok) put("error", "The system refused the action") })
-                            }
-                            else -> error("Unknown action: $action")
+    /**
+     * Performs one action. [PhoneServer] calls this on the main thread, owns the
+     * credential check, the budget, the notice and the reply; this only knows how to
+     * carry the action out through the accessibility service.
+     */
+    private fun dispatch(action: String, args: JSONObject, finish: (JSONObject) -> Unit) {
+        try {
+            when (action) {
+                "launch" -> finish(launch(args))
+                "screenshot" -> capture(finish)
+                else -> {
+                    val root = rootInActiveWindow ?: error("No active window; unlock the device")
+                    val pkg = root.packageName?.toString().orEmpty()
+                    check(pkg in PhoneControl.allowed) { "Foreground app is not allowed: $pkg" }
+                    when (action) {
+                        "observe" -> finish(observe(root, pkg))
+                        "tap" -> tap(root, args, finish)
+                        "type" -> finish(type(root, args))
+                        "scroll" -> scroll(args, finish)
+                        "key" -> {
+                            val key = args.getString("key")
+                            check(key == "back" || key == "home") { "Only back/home are supported" }
+                            val ok = performGlobalAction(if (key == "back") GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
+                            finish(JSONObject().put("ok", ok).apply { if (!ok) put("error", "The system refused the action") })
                         }
+                        else -> error("Unknown action: $action")
                     }
                 }
-            } catch (e: Exception) { finish(JSONObject().put("ok", false).put("error", e.message)) }
-        }
-        if (!done.await(8, TimeUnit.SECONDS)) { main.removeCallbacksAndMessages(null); PhoneControl.revoke() }
-        return result
+            }
+        } catch (e: Exception) { finish(JSONObject().put("ok", false).put("error", e.message)) }
     }
 
     // ---- actions -------------------------------------------------------------
@@ -461,7 +383,7 @@ class PocketAccessibilityService : AccessibilityService() {
         windows.lastOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }?.root?.packageName?.toString()
             ?: rootInActiveWindow?.packageName?.toString().orEmpty()
 
-    private fun capture(credential: String, finish: (JSONObject) -> Unit) {
+    private fun capture(finish: (JSONObject) -> Unit) {
         val pkg = foregroundPackage()
         if (pkg !in PhoneControl.allowed) {
             finish(JSONObject().put("ok", false).put("error", "Foreground app is not allowed: $pkg"))
@@ -486,43 +408,32 @@ class PocketAccessibilityService : AccessibilityService() {
                         if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
                         finish(result)
                     } else {
-                        captureAccessibility(credential, notice, finish)
+                        captureAccessibility(notice, finish)
                     }
                 }
             }, "pocket-shot").start()
             return
         }
-        main.postDelayed({ captureAccessibility(credential, notice, finish) }, 150)
+        main.postDelayed({ captureAccessibility(notice, finish) }, 150)
     }
 
     /** The fallback for devices that do not run Shizuku. */
-    private fun captureAccessibility(credential: String, notice: Boolean, finish: (JSONObject) -> Unit) {
+    private fun captureAccessibility(notice: Boolean, finish: (JSONObject) -> Unit) {
         if (Build.VERSION.SDK_INT < 30) {
             finish(JSONObject().put("ok", false).put("error", "Screenshots need Android 11 or a running Shizuku"))
             return
         }
-        captureFrame(credential, revision.get()) { result ->
+        captureFrame(revision.get()) { result ->
             if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
             finish(result)
         }
     }
 
-    /** Scales, compresses and packages one frame for the model. */
-    private fun encode(source: Bitmap, pkg: String): JSONObject {
-        val bitmap = source.copy(Bitmap.Config.ARGB_8888, false)
-        val width = bitmap.width
-        val height = bitmap.height
-        val ratio = minOf(1f, 1440f / maxOf(bitmap.width, bitmap.height))
-        val small = Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
-        val output = ByteArrayOutputStream(); small.compress(Bitmap.CompressFormat.JPEG, 85, output)
-        if (small !== bitmap) small.recycle()
-        bitmap.recycle()
-        return JSONObject().put("ok", true).put("width", width).put("height", height).put("input", inputStatus(pkg))
-            .put("imageBase64", android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP))
-    }
+    /** Scales, compresses and packages one frame, in the shape both backends return. */
+    private fun encode(source: Bitmap, pkg: String): JSONObject = PhoneFrame.encode(source, pkg, inputStatus(pkg))
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
-    private fun captureFrame(credential: String, at: Long, finish: (JSONObject) -> Unit) {
+    private fun captureFrame(at: Long, finish: (JSONObject) -> Unit) {
         val windows = windows.toList()
         val pkg = rootInActiveWindow?.packageName?.toString().orEmpty()
         if (pkg !in PhoneControl.allowed) {
@@ -548,7 +459,9 @@ class PocketAccessibilityService : AccessibilityService() {
         takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
             override fun onSuccess(value: ScreenshotResult) {
                 try {
-                    check(PhoneControl.authorized(credential) && at == revision.get()) { "The screen changed while capturing; retry" }
+                    // The request was authorised before it started; only the screen may
+                    // have moved on, which invalidates the frame.
+                    check(at == revision.get() || !PhoneControl.enabled.value) { "The screen changed while capturing; retry" }
                     val source = Bitmap.wrapHardwareBuffer(value.hardwareBuffer, value.colorSpace) ?: error("Empty screenshot")
                     try { finish(encode(source, pkg)) } finally { source.recycle() }
                 } catch (e: Exception) { finish(JSONObject().put("ok", false).put("error", e.message)) }

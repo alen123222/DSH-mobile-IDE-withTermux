@@ -28,6 +28,28 @@ class PhoneFixtureActivity : Activity() {
                 catch (e: Throwable) { "FAIL: " + android.util.Log.getStackTraceString(e) }
             java.io.File(filesDir, "phone-agent-test.txt").writeText(output)
         }.start()
+        // Proves the Shizuku action backend: dump, resolve a label, inject a tap — all
+        // as the shell user, with no accessibility service in the picture.
+        if (intent.getBooleanExtra("shzphone", false)) Thread {
+            try {
+                ShizukuShot.observe(this)
+                Thread.sleep(2000)
+                val observed = ShizukuPhone.observe(this)
+                val nodes = observed.optJSONArray("nodes")
+                val labels = (0 until (nodes?.length() ?: 0))
+                    .mapNotNull { nodes?.getJSONObject(it)?.optString("text")?.takeIf { text -> text.isNotBlank() } }
+                    .take(6)
+                val tapped = ShizukuPhone.tap(this, org.json.JSONObject().put("text", "PHONE-TEST-BUTTON"))
+                val after = ShizukuPhone.observe(this)
+                java.io.File(filesDir, "shz-phone-test.txt").writeText(
+                    "ok=" + observed.optBoolean("ok") + " count=" + observed.optInt("count") +
+                        " pkg=" + observed.optString("package") + " labels=" + labels.joinToString("|") +
+                        " tapOk=" + tapped.optBoolean("ok") + " tapError=" + tapped.optString("error") +
+                        " after=" + after.optInt("count"))
+            } catch (e: Throwable) {
+                java.io.File(filesDir, "shz-phone-test.txt").writeText("FAIL: " + android.util.Log.getStackTraceString(e))
+            }
+        }.start()
         // Proves the Shizuku path end to end: the PNG magic number cannot appear unless
         // a real screenshot came back through the shell user.
         if (intent.getBooleanExtra("shizuku", false)) Thread {
