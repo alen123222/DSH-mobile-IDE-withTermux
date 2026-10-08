@@ -19,6 +19,15 @@ android {
     }
     buildFeatures { compose = true; buildConfig = true; aidl = true }
     signingConfigs.getByName("debug") { storeFile = rootProject.file(".cache/debug.keystore") }
+    buildTypes {
+        release {
+            // Signed with the project key so this installs over an existing debug build
+            // instead of demanding an uninstall. What differs is the rest of the build
+            // type: not debuggable, and none of the debug-only fixtures.
+            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = false
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
