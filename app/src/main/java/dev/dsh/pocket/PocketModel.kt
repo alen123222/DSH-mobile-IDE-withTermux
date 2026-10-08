@@ -128,18 +128,23 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         transcriptPositions[id] = index to offset
     }
     /** One preset per model: the chat page's picker lists exactly these. */
-    fun addPresetsFor(ids: List<String>, template: EngineSettings): Int {
+    fun addPresetsFor(ids: List<String>, template: EngineSettings, label: String): Int {
         var added = 0
-        for (id in ids) if (savePreset(null, id, template.copy(model = id))) added++
+        for (id in ids) if (savePreset(null, id, template.copy(model = id), label)) added++
         return added
     }
     fun dismissError() = mutable.update { it.copy(error = null) }
     fun error(message: String) = mutable.update { it.copy(error = message) }
-    fun savePreset(id: String?, name: String, settings: EngineSettings): Boolean {
+    /**
+     * The provider a model belongs to travels with it, so the pane can group models
+     * without a second store. Editing keeps whatever group the model already had.
+     */
+    fun savePreset(id: String?, name: String, settings: EngineSettings, group: String? = null): Boolean {
         try {
             ProviderEndpoint.base(settings)
             require(name.isNotBlank() && settings.model.isNotBlank()) { tr("请填写预设名称和模型 ID") }
-            val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route))
+            val label = group ?: state.value.presets.firstOrNull { it.id == id }?.group.orEmpty()
+            val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route), label.trim())
             val items = if (state.value.presets.any { it.id == preset.id })
                 state.value.presets.map { if (it.id == preset.id) preset else it } else state.value.presets + preset
             secrets.savePresets(preset.id, items)
@@ -159,6 +164,34 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         secrets.savePresets(active.id, items)
         mutable.update { it.copy(presets = items, activePresetId = active.id, settings = active.settings) }
     }
+    /** Renames a provider and applies one address, key and protocol to all its models. */
+    fun updateProvider(ids: List<String>, label: String, baseUrl: String, apiKey: String, protocol: String): Boolean {
+        try {
+            require(baseUrl.isNotBlank()) { tr("需要填写 API 地址") }
+            val wanted = ids.toSet()
+            val items = state.value.presets.map { preset ->
+                if (preset.id !in wanted) preset else ApiPreset(preset.id, preset.name,
+                    preset.settings.copy(baseUrl = baseUrl.trim(), apiKey = apiKey.trim(), protocol = protocol,
+                        provider = if (protocol == "deepseek-messages") "deepseek-official" else "pocket-openai"), label.trim())
+            }
+            val active = state.value.activePresetId
+            secrets.savePresets(active, items)
+            mutable.update { it.copy(presets = items, settings = items.firstOrNull { preset -> preset.id == active }?.settings ?: it.settings) }
+            return true
+        } catch (e: Exception) { error(e.message ?: tr("保存失败")); return false }
+    }
+
+    /** Removes a provider together with every model under it. */
+    fun deleteProvider(ids: List<String>): Boolean {
+        val wanted = ids.toSet()
+        val items = state.value.presets.filterNot { it.id in wanted }
+        if (items.isEmpty()) { error(tr("请至少保留一个供应商")); return false }
+        val active = items.firstOrNull { it.id == state.value.activePresetId } ?: items.first()
+        secrets.savePresets(active.id, items)
+        mutable.update { it.copy(presets = items, activePresetId = active.id, settings = active.settings) }
+        return true
+    }
+
     fun selectReasoning(effort: String) {
         val current = state.value
         if (effort !in reasoningLevels(current.settings.protocol)) return

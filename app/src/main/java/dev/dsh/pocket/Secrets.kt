@@ -46,7 +46,7 @@ class Secrets(context: Context) {
     fun presets(): Pair<String, List<ApiPreset>> {
         read("api-presets")?.let { value ->
             val json = JSONObject(value)
-            val items = json.objects("items").map { ApiPreset(it.getString("id"), it.getString("name"), EngineSettings.from(it.getJSONObject("settings"))) }
+            val items = json.objects("items").map { ApiPreset(it.getString("id"), it.getString("name"), EngineSettings.from(it.getJSONObject("settings")), it.optString("group")) }
             if (items.isNotEmpty()) return json.string("activeId", items.first().id) to items
         }
         val item = ApiPreset(UUID.randomUUID().toString(), tr("原有连接"), EngineSettings.from(JSONObject(read("engine") ?: "{}")))
@@ -56,7 +56,7 @@ class Secrets(context: Context) {
     fun savePresets(activeId: String, items: List<ApiPreset>) {
         require(items.isNotEmpty())
         write("api-presets", JSONObject().put("activeId", activeId).put("items", JSONArray(items.map {
-            JSONObject().put("id", it.id).put("name", it.name).put("settings", it.settings.json())
+            JSONObject().put("id", it.id).put("name", it.name).put("group", it.group).put("settings", it.settings.json())
         })).toString())
     }
 }

@@ -288,4 +288,21 @@ data class EngineSettings(val model: String = "deepseek-v4-flash", val provider:
     }
 }
 
-data class ApiPreset(val id: String, val name: String, val settings: EngineSettings)
+data class ApiPreset(val id: String, val name: String, val settings: EngineSettings, val group: String = "")
+
+/** Providers are the endpoints a model belongs to; the label is saved, or the host. */
+fun providerLabel(preset: ApiPreset): String {
+    val saved = preset.group.trim()
+    if (saved.isNotEmpty()) return saved
+    val host = preset.settings.baseUrl.trim().removePrefix("https://").removePrefix("http://").substringBefore('/')
+    return host.ifEmpty { tr("未命名供应商") }
+}
+
+/** Models that share an endpoint, a key and a protocol are one provider. */
+fun providerGroups(presets: List<ApiPreset>): List<Pair<String, List<ApiPreset>>> =
+    presets.groupBy { it.settings.protocol + "|" + it.settings.baseUrl.trim().trimEnd('/') + "|" + it.settings.apiKey }
+        .map { (_, items) -> providerLabel(items.first()) to items }
+
+/** The official DeepSeek endpoint speaks its own protocol; everything else is OpenAI. */
+fun inferProtocol(baseUrl: String): String =
+    if (baseUrl.contains("api.deepseek.com")) "deepseek-messages" else "openai-chat"
