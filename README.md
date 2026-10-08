@@ -260,8 +260,11 @@ $cred = ('protocol=https' + $nl + 'host=github.com' + $nl + $nl) | git credentia
 $token = ($cred | Where-Object { $_ -like 'password=*' }).ToString().Substring(9)
 $h = @{ Authorization = 'token ' + $token; Accept = 'application/vnd.github+json'; 'User-Agent' = 'dsh-pocket-build' }
 $api = 'https://api.github.com/repos/alen123222/DSH-mobile-IDE-withTermux'
-$body = @{ tag_name = $tag; name = "DSH Pocket $tag"; body = '版本说明' } | ConvertTo-Json
-$rel = Invoke-RestMethod -Method Post -Uri ($api + '/releases') -Headers $h -Body $body -ContentType 'application/json'
+# Windows PowerShell 把字符串按 ASCII 发送，中文会全部变成 "?"。写成 UTF-8 字节再发。
+$payload = @{ tag_name = $tag; name = "DSH Pocket $tag"; body = '版本说明（可写中文）' } | ConvertTo-Json
+[System.IO.File]::WriteAllText("$env:TEMP\pocket-release.json", $payload, [System.Text.UTF8Encoding]::new($false))
+$rel = Invoke-RestMethod -Method Post -Uri ($api + '/releases') -Headers $h `
+    -Body ([System.IO.File]::ReadAllBytes("$env:TEMP\pocket-release.json")) -ContentType 'application/json; charset=utf-8'
 foreach ($f in @('artifacts\apk\dsh-pocket-0.6.2-release.apk', 'artifacts\apk\dsh-pocket-0.6.2-debug.apk')) {
     Invoke-RestMethod -Method Post -Headers $h -InFile $f -ContentType 'application/vnd.android.package-archive' `
         -Uri ('https://uploads.github.com/repos/alen123222/DSH-mobile-IDE-withTermux/releases/' + $rel.id + '/assets?name=' + (Split-Path $f -Leaf))
@@ -269,6 +272,8 @@ foreach ($f in @('artifacts\apk\dsh-pocket-0.6.2-release.apk', 'artifacts\apk\ds
 ```
 
 发布说明里要如实写出尚未验证的部分：真机装一次，并在设备上的 Termux 运行一次 `node --test`——Windows 无法创建管道，Node 回归只能在设备上跑。
+
+要改已发布 Release 的说明，用 `PATCH /releases/{id}`——`/releases/tags/{tag}` 只支持 GET，对它发 PATCH 不报错但也不会生效。
 
 ## 测试与验证
 
