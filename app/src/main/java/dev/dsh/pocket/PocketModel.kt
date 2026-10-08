@@ -31,8 +31,14 @@ data class Attachment(val name: String, val mimeType: String, val data: String =
 
 data class PocketState(
     val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
-    /** What the Termux installer is doing, as reported by the bridge. */
-    val engine: JSONObject? = null,
+    /** The engine installer's own output, followed the way the connection is. */
+    val engineLog: String = "", val engineStage: String = "", val engineSeconds: Int = 0, val engineRunning: Boolean = false,
+    /** How much the installer has downloaded, for the silent stretch npm produces. */
+    val engineSize: String = "",
+    /** "global" or "china": the package source the first install should use. */
+    val mirror: String = "global",
+    val connectionStage: String = "", val connectionSeconds: Int = 0, val connectionFailure: String? = null,
+    val connectionLog: String = "",
     val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
     val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
@@ -201,79 +207,133 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         savePreset(preset.id, preset.name, current.settings.copy(reasoningEffort = effort))
     }
 
+    private var installing: Job? = null
+
     /**
-     * The engine installer runs inside Termux, where its output is only visible if the
-     * user happens to be looking at the terminal. The bridge reads the installer's own
-     * log, so this is what turns "no engine" into "stopped at step 2".
+     * Installs the engine and follows it the way connect() follows the service: a stage,
+     * a clock, the installer's own log, and finally a health re-read so the row can say
+     * the engine was found rather than waiting for the user to refresh by hand.
      */
-    fun refreshEngine() {
-        if (!state.value.connected) return
-        viewModelScope.launch {
-            runCatching { api.call("engine", "GET") }.onSuccess { status -> mutable.update { it.copy(engine = status) } }
+    fun installEngine() {
+        if (installing?.isActive == true) return
+        mutable.update { it.copy(engineRunning = true, engineStage = tr("正在安装引擎…"), engineSeconds = 0, engineLog = "", engineSize = "") }
+        installing = viewModelScope.launch {
+            val began = android.os.SystemClock.elapsedRealtime()
+            val ticker = launch {
+                while (true) {
+                    mutable.update { it.copy(engineSeconds = ((android.os.SystemClock.elapsedRealtime() - began) / 1000).toInt()) }
+                    delay(1000)
+                }
+            }
+            try {
+                TermuxConnection.track { id, reply ->
+                    TermuxConnection.installEngine(getApplication(), id)
+                    while (true) {
+                        val (size, log) = TermuxConnection.engineProgress(getApplication())
+                        if (log.isNotBlank()) mutable.update { it.copy(engineLog = log) }
+                        if (size.isNotBlank()) mutable.update { it.copy(engineSize = size) }
+                        if (reply.isCompleted) {
+                            val outcome = reply.await()
+                            check(!outcome.failed) { outcome.text }
+                            break
+                        }
+                        check(android.os.SystemClock.elapsedRealtime() - began < 30 * 60 * 1000L) { tr("安装超过 30 分钟，请看日志末尾") }
+                        delay(2000)
+                    }
+                }
+                // Re-reading health is what flips the row to "found"; without it a
+                // finished install still looked like no engine at all.
+                val health = api.health()
+                mutable.update { it.copy(health = health) }
+                check(!health.string("dsh").isNullOrBlank()) { tr("安装结束了，但没有检测到引擎，请看日志末尾") }
+                mutable.update { it.copy(engineStage = tr("引擎已就绪")) }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { error(describe(e)) }
+            finally { ticker.cancel(); mutable.update { it.copy(engineRunning = false) } }
         }
     }
 
-    fun connect(start: Boolean = true) {
+    fun setMirror(value: String) = mutable.update { it.copy(mirror = if (value == "china") "china" else "global") }
+
+    fun connect(start: Boolean = true, firstRun: Boolean = false) {
         if (connecting?.isActive == true) return
+        mutable.update { it.copy(connecting = true, connectionFailure = null,
+            connectionLog = "", connectionSeconds = 0, connectionStage = tr("正在检查本地服务…")) }
         connecting = viewModelScope.launch {
-            mutable.update { it.copy(connecting = true) }
-            // Keep the real reason. "服务未连接" on its own made a healthy
-            // service look broken when the real fault was elsewhere.
-            var lastFailure = tr("尚未尝试连接")
-            var failure = { value: String -> lastFailure = value }
-            try {
-                var health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
-                    .onFailure { failure(describe(it)) }.getOrNull()
-                if (health == null && start) {
-                    TermuxConnection.bootstrap(getApplication(), token)
-                    // Bootstrap returns immediately when a healthy service is
-                    // already up, so retry against every candidate address rather
-                    // than assuming loopback. A VPN can route the app's 127.0.0.1
-                    // away from the device while Termux still reaches it.
-                    for (attempt in 0 until 30) {
-                        delay(500)
-                        health = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
-                            .onFailure { failure(describe(it)) }.getOrNull()
-                        if (health != null) break
-                        if (attempt == 6 || attempt == 14) {
-                            val reachable = runCatching {
-                                withContext(Dispatchers.IO) {
-                                    api.probeHosts().also { api.preferHost(it) }
-                                }
-                            }.onFailure { failure(describe(it)) }.getOrNull()
-                            if (reachable != null) health = withContext(Dispatchers.IO) { api.call("health") }
-                            if (health != null) break
+            val began = android.os.SystemClock.elapsedRealtime()
+            val ticker = launch {
+                while (true) {
+                    mutable.update { it.copy(connectionSeconds = ((android.os.SystemClock.elapsedRealtime() - began) / 1000).toInt()) }
+                    delay(1000)
+                }
+            }
+            var lastFailure = ""
+            suspend fun checkHealth(): JSONObject? = try { api.health() }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { lastFailure = describe(e); null }
+            suspend fun launchAndWait(upgrade: Boolean): JSONObject {
+                mutable.update { it.copy(connectionStage = tr("正在检查 Termux 命令权限…")) }
+                TermuxConnection.probe(getApplication())
+                return TermuxConnection.track { id, reply ->
+                    mutable.update { it.copy(connected = false, connectionStage = if (upgrade)
+                        tr("正在更新本地服务…") else tr("已发送，正在等 Termux 中的服务启动…")) }
+                    when {
+                        upgrade -> TermuxConnection.upgrade(getApplication(), token, id)
+                        firstRun -> TermuxConnection.firstRun(getApplication(), token, id, state.value.mirror)
+                        else -> TermuxConnection.bootstrap(getApplication(), token, id, state.value.mirror)
+                    }
+                    val ready = kotlinx.coroutines.withTimeoutOrNull(if (firstRun && !upgrade) 600000L else 60000L) {
+                        var health: JSONObject? = null
+                        var attempt = 0
+                        while (health == null) {
+                            if (firstRun && !upgrade && attempt % 2 == 0) {
+                                val log = TermuxConnection.startupLog(getApplication())
+                                if (log.isNotBlank()) mutable.update { it.copy(connectionLog = log,
+                                    connectionStage = tr("正在安装运行环境并启动服务，首次下载可能需要几分钟…")) }
+                            }
+                            if (reply.isCompleted) {
+                                val result = reply.await()
+                                check(!result.failed) { result.text }
+                            }
+                            val tick = android.os.SystemClock.elapsedRealtime()
+                            api.preferHost(api.candidates[attempt++ % api.candidates.size])
+                            val next = checkHealth()
+                            if (next != null && (!upgrade || next.string("version") == BRIDGE_VERSION)) health = next
+                            else delay((2000 - (android.os.SystemClock.elapsedRealtime() - tick)).coerceAtLeast(1))
                         }
+                        health
                     }
+                    ready ?: throw IllegalStateException((if (firstRun && !upgrade)
+                        tr("首次安装等待已达 10 分钟，尚未连接。请查看下方安装日志；重试会继续等待已有安装，不会重复启动。")
+                        else tr("等待服务启动已达 60 秒，尚未连接。安装可能仍在进行，请打开 Termux 查看；稍后可重试连接。")) + "\n" + lastFailure)
                 }
-                if (health != null && health.string("version") != BRIDGE_VERSION && start) {
-                    TermuxConnection.upgrade(getApplication(), token)
-                    health = null
-                    for (attempt in 0 until 40) {
-                        delay(500)
-                        val next = runCatching { withContext(Dispatchers.IO) { api.call("health") } }
-                            .onFailure { failure(describe(it)) }.getOrNull()
-                        if (next?.string("version") == BRIDGE_VERSION) { health = next; break }
-                    }
-                }
+            }
+            try {
+                var health = checkHealth()
+                if (health == null && start) health = launchAndWait(false)
+                if (health != null && health.string("version") != BRIDGE_VERSION && start) health = launchAndWait(true)
+                mutable.update { it.copy(connected = health != null, health = health,
+                    connectionStage = if (health != null) tr("本地服务已连接") else "") }
                 if (health != null) {
-                    // Mark connected before listing workspaces: the health call is
-                    // the real proof the service is up, and a failure while listing
-                    // must not leave the UI claiming the service is unreachable.
-                    mutable.update { it.copy(connected = true, health = health) }
-                    val workspaces = runCatching {
-                        withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
-                    }.onFailure { failure(describe(it)) }.getOrDefault(state.value.workspaces)
+                    ticker.cancel()
+                    mutable.update { it.copy(connecting = false) }
+                    val workspaces = withContext(Dispatchers.IO) { api.call("workspaces").objects("items").map(Workspace::from) }
                     mutable.update { it.copy(workspaces = workspaces) }
                     if (state.value.selected == null && workspaces.isNotEmpty()) select(workspaces.first())
-                } else {
-                    mutable.update { it.copy(connected = false) }
-                    if (start) error(tr("本地服务无响应（") + lastFailure + tr("；已尝试 ") + api.candidates.joinToString("/") + tr("）。") +
-                        tr("若 Termux 显示 local service already running，说明服务在跑但 App 连不上；") +
-                        tr("请到 设置 → WLAN → 当前网络 → 高级 → 代理 改为「无」，或重启手机后再试。"))
                 }
-            } catch (e: Exception) { error(describe(e)) }
-            finally { mutable.update { it.copy(connecting = false) } }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (firstRun) {
+                    val log = try { TermuxConnection.startupLog(getApplication()) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { "" }
+                    if (log.isNotBlank()) mutable.update { it.copy(connectionLog = log) }
+                }
+                mutable.update { it.copy(connectionFailure = describe(e), connectionStage = tr("连接未完成")) }
+            } finally {
+                ticker.cancel()
+                mutable.update { it.copy(connecting = false) }
+            }
         }
     }
     private fun task(block: suspend () -> Unit) = viewModelScope.launch {

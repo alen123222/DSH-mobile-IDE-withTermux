@@ -62,6 +62,11 @@ class MainActivity : ComponentActivity() {
         TermuxConnection.allowed.value = granted
         if (!granted) model.error(tr("请在系统设置 → DSH Pocket → 权限中允许在 Termux 运行命令"))
     }
+    override fun onResume() {
+        super.onResume()
+        TermuxConnection.refreshPermission(this)
+        TermuxConnection.refreshOverlay(this)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Align Java's default locale with this app's effective one: the system
@@ -510,28 +515,53 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                     // must allow this app to run commands in Termux, and Termux must have
                     // its own switch on. Showing only one of them is how a first run
                     // ended up with nothing left to press.
-                    Text(tr("首次连接会安装 Node/Python、写入配置并启动本地服务。"), style = MaterialTheme.typography.bodyMedium)
+                    Text(tr("首次连接会安装 Node/Python、写入配置并启动本地服务。三步都要做完。"), style = MaterialTheme.typography.bodyMedium)
+                    // The package source decides whether the first download takes minutes or
+                    // the better part of an hour, and only the user knows where they are. It is
+                    // written into Termux once, so it is a starting choice, not a setting.
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(tr("包源"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        FilterChip(selected = state.mirror == "global", onClick = { model.setMirror("global") }, label = { Text(tr("全球")) })
+                        FilterChip(selected = state.mirror == "china", onClick = { model.setMirror("china") }, label = { Text(tr("中国大陆")) })
+                    }
+                    Text(tr("决定首次下载几百 MB 的速度；只需选一次，会写入 Termux 的软件源。"), style = MaterialTheme.typography.bodySmall)
+                    // ① Android must allow this app to run commands in Termux.
                     if (permitted) {
-                        Text(tr("✓ 已允许本应用在 Termux 中运行命令"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF16835F))
+                        Text(tr("✓ ① 已允许本应用在 Termux 中运行命令"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF16835F))
                     } else {
                         Button(onClick = grant) { Text(tr("① 授予 Termux 权限")) }
-                        Text(tr("系统会弹出授权框；它和 Termux 内部的开关是两件事，两个都要。"), style = MaterialTheme.typography.bodySmall)
+                        Text(tr("系统会弹出授权框，允许即可。"), style = MaterialTheme.typography.bodySmall)
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // This one acts. Termux refusing the command is the failure a
-                        // first-time user hits, so it opens the instructions with the reason.
-                        Button(enabled = permitted, onClick = {
-                            runCatching { TermuxConnection.firstRun(context, model.token) }
-                                .onSuccess { safe { TermuxConnection.openApp(context) } }
-                                .onFailure { onboarding = true; permission = true }
-                        }) { Text(tr("② 一键完成首次连接")) }
-                        OutlinedButton(onClick = { onboarding = true; permission = true }) { Text(tr("Termux 里的开关")) }
+                    // ② Termux's own switch. It cannot be read from here, so a trivial
+                    // command answers the question instead: Termux refuses it by name.
+                    var probeTick by remember { mutableStateOf(0) }
+                    var termuxReady by remember { mutableStateOf<Boolean?>(null) }
+                    LaunchedEffect(permitted, probeTick) {
+                        termuxReady = if (!permitted) null
+                        else runCatching { TermuxConnection.probe(context) }.fold({ true }, { false })
+                    }
+                    when (termuxReady) {
+                        true -> Text(tr("✓ ② Termux 已允许其他应用运行命令"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF16835F))
+                        else -> {
+                            OutlinedButton(onClick = {
+                                (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                                    .setPrimaryClip(ClipData.newPlainText(tr("Termux 配置"), permissionCommand))
+                                safe { TermuxConnection.openApp(context) }
+                            }) { Text(tr("② 允许其他应用在 Termux 中运行命令")) }
+                            Text(permissionCommand, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                            Text(tr("在 Termux 里执行上面这行（已复制），然后回来检查。"), style = MaterialTheme.typography.bodySmall)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = { probeTick++ }) { Text(tr("已执行，检查")) }
+                                TextButton(onClick = { onboarding = true; permission = true }) { Text(tr("看说明")) }
+                            }
+                        }
+                    }
+                    // ③ Everything is in place: one tap does the rest.
+                    Button(enabled = permitted && !state.connecting, onClick = { model.connect(firstRun = true) }) {
+                        Text(tr("③ 一键完成首次连接"))
                     }
                 }
                 Button(onClick = {
-                    // Starting the local service means Termux has to be up; on a cold
-                    // device a background command would run unseen.
-                    if (!state.connected) safe { TermuxConnection.openApp(context) }
                     model.connect()
                 }, enabled = !state.connecting) {
                     if (state.connecting) { CircularProgressIndicator(Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)) }
@@ -541,7 +571,22 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 // Termux names its own requirements precisely. Repeating the one it
                 // actually named, with the command attached, is the difference between an
                 // error message and a next step.
-                if (result.contains("allow-external-apps", ignoreCase = true)) {
+                if (state.connecting) Text(state.connectionStage + " · " + state.connectionSeconds + tr(" 秒"))
+                state.connectionFailure?.let {
+                    if (!it.contains("allow-external-apps", true) && !it.contains("display over other apps", true) && !it.contains("SYSTEM_ALERT_WINDOW", true))
+                        Text(it, color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.heightIn(max = 120.dp).verticalScroll(rememberScrollState()))
+                }
+                if (state.connectionLog.isNotBlank()) {
+                    val logScroll = rememberScrollState()
+                    LaunchedEffect(state.connectionLog, logScroll.maxValue) { logScroll.scrollTo(logScroll.maxValue) }
+                    Text(tr("运行环境安装日志（自动刷新）"), fontWeight = FontWeight.SemiBold)
+                    Text(state.connectionLog, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.heightIn(max = 180.dp).verticalScroll(logScroll))
+                }
+                if (!state.connected) TextButton(onClick = { safe { TermuxConnection.openApp(context) } }) { Text(tr("打开 Termux 查看")) }
+                val connectionError = state.connectionFailure.orEmpty()
+                if (connectionError.contains("allow-external-apps", ignoreCase = true)) {
                     Text(tr("Termux 拒绝了命令：它内部的 allow-external-apps 开关没有打开。"),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                     Text(permissionCommand, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
@@ -555,8 +600,8 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 // and that refusal is what a first run sees as "nothing happened".
                 val overlay by TermuxConnection.overlay.collectAsStateWithLifecycle()
                 LaunchedEffect(result) { TermuxConnection.refreshOverlay(context) }
-                if (!overlay) {
-                    Text(tr("Termux 还需要「显示在其他应用上层」权限，否则它不会在后台启动会话。"),
+                if (!overlay || connectionError.contains("display over other apps", true) || connectionError.contains("SYSTEM_ALERT_WINDOW", true)) {
+                    Text(tr("Termux 在后台打开终端窗口时需要「显示在其他应用上层」权限。"),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                     OutlinedButton(onClick = { safe { TermuxConnection.overlaySettings(context) } }) { Text(tr("打开 Termux 权限设置")) }
                 }
@@ -578,12 +623,9 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                     .setPrimaryClip(ClipData.newPlainText(tr("Termux 配置"), permissionCommand))
                 safe { TermuxConnection.openApp(context) }
             }) { Text(tr("复制命令并打开 Termux")) } },
-            dismissButton = { TextButton(onClick = {
+            dismissButton = { TextButton(enabled = permitted && !state.connecting, onClick = {
                 onboarding = false; permission = false
-                // A silent failure here is what made this look like nothing happened.
-                runCatching { TermuxConnection.firstRun(context, model.token) }
-                    .onSuccess { safe { TermuxConnection.openApp(context) } }
-                    .onFailure { model.error(it.message ?: tr("Termux 没有接受命令")) }
+                model.connect(firstRun = true)
             }) { Text(tr("已设置，开始连接")) } })
         Surface(shape = RoundedCornerShape(18.dp), color = Color.White) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -591,34 +633,31 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 Text(if (state.health?.string("dsh").isNullOrBlank()) tr("尚未检测到引擎") else tr("已发现 DSH · SDK 模式"), color = Color(0xFF64748B))
                 var maintenance by remember { mutableStateOf(false) }
                 if (state.health?.string("dsh").isNullOrBlank()) {
-                    Button(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("安装引擎")) }
-                    // Without this the engine row said only "no engine" while a silent
-                    // Termux was in fact still installing, or had stopped at a step.
-                    val tail = state.engine?.optJSONArray("tail")?.let { array ->
-                        (0 until array.length()).joinToString("\n") { array.optString(it) }
-                    }.orEmpty()
-                    val step = state.engine?.string("step")
-                    when {
-                        state.engine?.optBoolean("failed") == true -> Text(tr("上次安装失败，日志末尾如下："), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                        !step.isNullOrBlank() -> Text(tr("安装进行到这里：") + step, style = MaterialTheme.typography.bodySmall)
-                        else -> Text(tr("安装日志会在这里显示进度。"), style = MaterialTheme.typography.bodySmall)
+                    Button(onClick = { model.installEngine() }, enabled = state.connected && !state.engineRunning) {
+                        Text(if (state.engineRunning) tr("正在安装…") else tr("安装引擎"))
                     }
-                    if (tail.isNotBlank()) {
-                        var showLog by remember { mutableStateOf(false) }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(onClick = { showLog = !showLog }) { Text(if (showLog) tr("收起日志") else tr("查看安装日志")) }
-                            TextButton(onClick = { model.refreshEngine() }) { Text(tr("刷新进度")) }
+                    // The installer runs inside Termux, so its own log is streamed back
+                    // here and followed: stage, clock, and the tail scrolling itself.
+                    if (state.engineStage.isNotBlank()) {
+                        // The size is the answer to "is anything happening" during the
+                        // download, which npm keeps silent about.
+                        val progress = listOf(state.engineStage, state.engineSize.takeIf { it.isNotBlank() }?.let { tr("已下载 ") + it },
+                            state.engineSeconds.toString() + tr(" 秒")).filterNotNull().joinToString(" · ")
+                        Text(progress, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (state.engineLog.isNotBlank()) {
+                        val logScroll = rememberScrollState()
+                        LaunchedEffect(state.engineLog, logScroll.maxValue) { logScroll.scrollTo(logScroll.maxValue) }
+                        Surface(shape = RoundedCornerShape(10.dp), color = Color(0xFF0F172A), modifier = Modifier.fillMaxWidth()) {
+                            Text(state.engineLog, fontFamily = FontFamily.Monospace, color = Color(0xFFE2E8F0),
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.heightIn(max = 200.dp).verticalScroll(logScroll).padding(10.dp))
                         }
-                        if (showLog) Text(tail, style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()))
-                    } else {
-                        TextButton(onClick = { model.refreshEngine() }) { Text(tr("刷新进度")) }
                     }
-                    LaunchedEffect(state.health?.string("version")) { model.refreshEngine() }
                 } else {
                     TextButton(onClick = { maintenance = !maintenance }) { Text(tr("维护选项")) }
                     if (maintenance) {
-                        OutlinedButton(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("更新引擎")) }
+                        OutlinedButton(onClick = { model.installEngine() }, enabled = state.connected && !state.engineRunning) { Text(tr("更新引擎")) }
                         TextButton(onClick = { safe { TermuxConnection.openTerminal(context, state.selected?.path ?: TermuxConnection.HOME) } }) { Text(tr("打开原生 Termux 终端")) }
                     }
                 }

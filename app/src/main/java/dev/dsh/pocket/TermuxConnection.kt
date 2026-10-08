@@ -11,6 +11,9 @@ import android.os.Build
 import android.net.Uri
 import android.provider.Settings
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.UUID
 import org.json.JSONObject
 
 object TermuxConnection {
@@ -18,6 +21,30 @@ object TermuxConnection {
     const val HOME = "/data/data/com.termux/files/home"
     const val PREFIX = "/data/data/com.termux/files/usr"
     val lastResult = MutableStateFlow("")
+    private val pending = mutableMapOf<String, CompletableDeferred<CommandResult>>()
+    data class CommandResult(val exitCode: Int?, val errorCode: Int, val text: String) {
+        // Termux uses Android RESULT_OK (-1), separate from shell exit status (0).
+        val failed get() = errorCode != -1 || exitCode != 0
+    }
+    fun complete(id: String?, result: CommandResult) { pending[id]?.complete(result) }
+    suspend fun <T> track(block: suspend (String, CompletableDeferred<CommandResult>) -> T): T {
+        val id = UUID.randomUUID().toString()
+        val reply = CompletableDeferred<CommandResult>()
+        pending[id] = reply
+        try { return block(id, reply) } finally { pending.remove(id) }
+    }
+    suspend fun probe(context: Context) = track { id, reply ->
+        run(context, "exit 0\n", true, tr("检查 Termux 命令权限"), id)
+        val result = withTimeoutOrNull(10000) { reply.await() }
+            ?: error(tr("Termux 未返回权限检查结果。请打开 Termux 完成初始化，再回来重试。"))
+        check(!result.failed) { result.text }
+    }
+    suspend fun startupLog(context: Context): String = track { id, reply ->
+        run(context, "tail -c 5500 \"\$HOME/.local/share/${BuildConfig.STATE_DIRECTORY}/first-run.log\" 2>/dev/null || true\n" +
+            "printf '\\nDownload cache: '; du -sh \"\$PREFIX/../../cache/apt/archives\" 2>/dev/null | cut -f1\n",
+            true, "", id, quiet = true)
+        withTimeoutOrNull(3000) { reply.await().text }.orEmpty()
+    }
     val setupCommand = "mkdir -p ~/.termux && printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties && termux-reload-settings"
 
     fun installed(context: Context): Boolean = try { context.packageManager.getPackageInfo("com.termux", 0); true } catch (_: PackageManager.NameNotFoundException) { false }
@@ -58,10 +85,12 @@ object TermuxConnection {
         }
     }
 
-    private fun run(context: Context, script: String, background: Boolean, title: String) {
+    private fun run(context: Context, script: String, background: Boolean, title: String, requestId: String? = null, quiet: Boolean = false) {
         check(installed(context)) { tr("请先安装并打开 Termux") }
         check(permitted(context)) { tr("请先授予“在 Termux 环境中运行命令”权限") }
         val receiver = Intent(context, TermuxResultReceiver::class.java)
+            .putExtra("pocketRequestId", requestId)
+            .putExtra("pocketQuiet", quiet)
         val callback = PendingIntent.getBroadcast(context, (System.nanoTime() and 0x7fffffff).toInt(), receiver,
             PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_MUTABLE)
         val intent = Intent("com.termux.RUN_COMMAND").apply {
@@ -77,7 +106,7 @@ object TermuxConnection {
             putExtra("com.termux.RUN_COMMAND_COMMAND_LABEL", title)
             putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
         }
-        lastResult.value = tr("已发送：") + title + tr("。前台任务的进度会显示在 Termux 中。")
+        if (!quiet) lastResult.value = tr("已发送：") + title + tr("。前台任务的进度会显示在 Termux 中。")
         check(context.startService(intent) != null) { tr("Termux 没有响应") }
     }
 
@@ -123,9 +152,10 @@ object TermuxConnection {
         fi
     """.trimIndent().asScriptBlock()
 
-    fun bootstrap(context: Context, token: String) {
+    fun bootstrap(context: Context, token: String, requestId: String? = null, mirror: String = "global") {
         val script = buildString {
             append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
+            append("bash \"\$ROOT/termux/choose-mirror.sh\" " + mirror + "\n")
             val config = JSONObject().put("token", token).put("port", BuildConfig.BRIDGE_PORT).toString()
             val base64 = Base64.encodeToString(config.toByteArray(), Base64.NO_WRAP)
             append("printf '%s' '$base64' | base64 -d > \"\$ROOT/connection.json\"\n")
@@ -133,27 +163,31 @@ object TermuxConnection {
             append(guardScript(token))
             append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
         }
-        run(context, script, true, tr("DSH Pocket 本地服务"))
+        run(context, script, true, tr("DSH Pocket 本地服务"), requestId)
     }
     /**
      * A first run in one Termux session: base packages, bridge assets, the connection
      * file and the service itself. Termux owns its prompt, so no app can prefill a
      * command for it — a single dispatched script is as close as the platform allows.
      */
-    fun firstRun(context: Context, token: String) {
+    fun firstRun(context: Context, token: String, requestId: String? = null, mirror: String = "global") {
         val script = buildString {
             append("set -eu\n")
-            append("pkg install -y nodejs-lts python\n")
             append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
+            append("export POCKET_HOME=\"\$ROOT\"\n")
+            // Before anything is downloaded, because that is the whole point of the choice.
+            append("bash \"\$ROOT/termux/choose-mirror.sh\" " + mirror + "\n")
+            append("bash \"\$ROOT/termux/prepare-runtime.sh\" || { code=\$?; if [ \"\$code\" = 75 ]; then exit 0; else exit \"\$code\"; fi; }\n")
+            append("exec >>\"\$ROOT/first-run.log\" 2>&1\necho '[3/3] Starting the local service.'\n")
             val config = JSONObject().put("token", token).put("port", BuildConfig.BRIDGE_PORT).toString()
             val base64 = Base64.encodeToString(config.toByteArray(), Base64.NO_WRAP)
             append("printf '%s' '$base64' | base64 -d > \"\$ROOT/connection.json\"\n")
             append(guardScript(token))
             append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
         }
-        run(context, script, true, tr("首次连接"))
+        run(context, script, true, tr("首次连接"), requestId)
     }
-    fun upgrade(context: Context, token: String) {
+    fun upgrade(context: Context, token: String, requestId: String? = null) {
         val script = buildString {
             append("set -eu\nexport POCKET_UPDATE_TOKEN='$token'\nnode --input-type=module <<'POCKET_UPDATE'\n")
             append("""
@@ -177,16 +211,40 @@ object TermuxConnection {
             append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
             append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
         }
-        run(context, script, true, tr("更新 DSH Pocket 本地服务"))
+        run(context, script, true, tr("更新 DSH Pocket 本地服务"), requestId)
     }
-    fun installEngine(context: Context) = run(context, buildString {
+    /**
+     * The installer's own log so far. It runs inside Termux, so reading that file back
+     * is the only way the app can show what the installation is doing, including when
+     * it stops and where.
+     */
+    /**
+     * The installer's log plus how much it has downloaded, in one command. The download
+     * step is silent for minutes because npm writes no progress when its output is not a
+     * terminal, and a growing directory is the only evidence that anything is happening.
+     */
+    suspend fun engineProgress(context: Context): Pair<String, String> = track { id, reply ->
+        val root = "$" + "HOME/.local/share/" + BuildConfig.STATE_DIRECTORY
+        run(context,
+            "printf 'POCKET_SIZE '; du -sh " + root + "/runtime 2>/dev/null | cut -f1\n" +
+                "printf 'POCKET_LOG\n'; tail -c 5500 " + root + "/install.log 2>/dev/null || true\n",
+            true, "", id, quiet = true)
+        val text = withTimeoutOrNull(4000) { reply.await().text }.orEmpty()
+        val size = text.lineSequence().firstOrNull { it.startsWith("POCKET_SIZE ") }
+            ?.removePrefix("POCKET_SIZE ")?.trim().orEmpty()
+        size to text.substringAfter("POCKET_LOG", "").trim()
+    }
+
+    // Background on purpose: a foreground session flashes a terminal the user cannot
+    // read anyway, while the log is what the app shows.
+    fun installEngine(context: Context, requestId: String? = null) = run(context, buildString {
         append("printf '\\nDSH Pocket: starting Android engine installation\\n'\n")
         // Refresh the installer even when the existing local service is still
         // running from an earlier APK. No server restart is required.
         append(assetsScript(context, listOf("termux")))
         append("export POCKET_HOME=\"\$ROOT\"\n")
         append("exec bash \"\$ROOT/termux/install-dsh.sh\"\n")
-    }, false, tr("安装 DSH Android 引擎"))
+    }, true, tr("安装 DSH Android 引擎"), requestId, quiet = true)
     fun installBase(context: Context) = run(context, "pkg install -y nodejs-lts python\n", false, tr("安装本地运行环境"))
     // Shared storage is only visible to Termux after this one-time grant; without
     // it /sdcard and /storage/emulated/0 do not exist, which is why the workspace
@@ -218,7 +276,12 @@ class TermuxResultReceiver : BroadcastReceiver() {
         val error = result.getString("errmsg").orEmpty()
         val output = result.getString("stdout").orEmpty() + result.getString("stderr").orEmpty()
         val exitCode = if (result.containsKey("exitCode")) result.getInt("exitCode").toString() else tr("未知")
-        TermuxConnection.lastResult.value = tr("Termux 任务结束 · 退出码 ") + exitCode + "\n" +
+        val summary = tr("Termux 任务结束 · 退出码 ") + exitCode + "\n" +
             (if (error.isNotBlank()) error else output).takeLast(12000)
+        val quiet = intent.getBooleanExtra("pocketQuiet", false)
+        if (!quiet) TermuxConnection.lastResult.value = summary
+        TermuxConnection.complete(intent.getStringExtra("pocketRequestId"), TermuxConnection.CommandResult(
+            if (result.containsKey("exitCode")) result.getInt("exitCode") else null,
+            result.getInt("err", -1), if (quiet) output.takeLast(6000) else summary))
     }
 }
