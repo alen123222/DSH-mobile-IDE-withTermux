@@ -31,6 +31,8 @@ data class Attachment(val name: String, val mimeType: String, val data: String =
 
 data class PocketState(
     val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
+    /** What the Termux installer is doing, as reported by the bridge. */
+    val engine: JSONObject? = null,
     val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
     val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
@@ -197,6 +199,18 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         if (effort !in reasoningLevels(current.settings.protocol)) return
         val preset = current.presets.firstOrNull { it.id == current.activePresetId } ?: return
         savePreset(preset.id, preset.name, current.settings.copy(reasoningEffort = effort))
+    }
+
+    /**
+     * The engine installer runs inside Termux, where its output is only visible if the
+     * user happens to be looking at the terminal. The bridge reads the installer's own
+     * log, so this is what turns "no engine" into "stopped at step 2".
+     */
+    fun refreshEngine() {
+        if (!state.value.connected) return
+        viewModelScope.launch {
+            runCatching { api.call("engine", "GET") }.onSuccess { status -> mutable.update { it.copy(engine = status) } }
+        }
     }
 
     fun connect(start: Boolean = true) {

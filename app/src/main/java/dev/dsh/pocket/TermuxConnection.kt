@@ -31,6 +31,33 @@ object TermuxConnection {
     val allowed = MutableStateFlow(false)
     fun refreshPermission(context: Context) { allowed.value = permitted(context) }
 
+    /**
+     * Termux needs "Display over other apps" to start a terminal session from the
+     * background on Android 10 and later. It is Termux's own permission, so it is read
+     * through AppOps rather than Settings.canDrawOverlays, which only answers for this
+     * app, and it is only reported as missing when the system says so explicitly.
+     */
+    val overlay = MutableStateFlow(true)
+    fun refreshOverlay(context: Context) {
+        overlay.value = try {
+            val ops = context.getSystemService(Context.APP_OPS_SERVICE) as? android.app.AppOpsManager
+            val uid = context.packageManager.getApplicationInfo("com.termux", 0).uid
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                ops?.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, uid, "com.termux")
+            else @Suppress("DEPRECATION") ops?.checkOpNoThrow(android.app.AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, uid, "com.termux")
+            mode != android.app.AppOpsManager.MODE_ERRORED && mode != android.app.AppOpsManager.MODE_IGNORED
+        } catch (_: Exception) { true }
+    }
+
+    /** Straight to the one switch Termux asks for, instead of a path through Settings. */
+    fun overlaySettings(context: Context) {
+        val packageUri = android.net.Uri.parse("package:com.termux")
+        val direct = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+        try { context.startActivity(direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {
+            try { context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) { }
+        }
+    }
+
     private fun run(context: Context, script: String, background: Boolean, title: String) {
         check(installed(context)) { tr("请先安装并打开 Termux") }
         check(permitted(context)) { tr("请先授予“在 Termux 环境中运行命令”权限") }

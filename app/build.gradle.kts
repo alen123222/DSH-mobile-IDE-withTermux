@@ -13,8 +13,8 @@ android {
         buildConfigField("String", "STATE_DIRECTORY", "\"dsh-pocket\"")
         minSdk = 26
         targetSdk = 35
-        versionCode = 22
-        versionName = "0.6.3-dev"
+        versionCode = 23
+        versionName = "0.6.4-dev"
         testInstrumentationRunner = "dev.dsh.pocket.ProviderSmokeInstrumentation"
     }
     buildFeatures { compose = true; buildConfig = true; aidl = true }

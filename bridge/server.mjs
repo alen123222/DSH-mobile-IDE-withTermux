@@ -76,6 +76,23 @@ function attachFile(body) {
 export function createBridge({ stateDir, token, dshOptions = {} }) {
   if (typeof token !== 'string' || token.length < 32) throw new Error('Bridge token must contain at least 32 characters');
   const workspaces = new Workspaces(stateDir, dshOptions), terminals = new Terminals(), chats = new DshSessions(stateDir, dshOptions);
+  // The installer tees its whole run into install.log and writes .pocket-ready only
+  // after the last step. Reporting both is the difference between "no engine" and
+  // "stopped at step 2", which a user staring at a silent Termux cannot tell apart.
+  const engineStatus = () => {
+    const runtime = path.join(stateDir, 'runtime');
+    const binary = path.join(runtime, 'bin', 'dsh-pocket');
+    let tail = [], updated = null, failed = false;
+    try {
+      const text = fs.readFileSync(path.join(stateDir, 'install.log'), 'utf8');
+      tail = text.split('\n').filter(line => line.trim().length > 0).slice(-14);
+      updated = fs.statSync(path.join(stateDir, 'install.log')).mtimeMs;
+      failed = /installation failed/i.test(text.slice(-4000));
+    } catch (_) { /* the installer has not run yet */ }
+    const step = tail.slice().reverse().find(line => /^\[\d+\/\d+\]/.test(line)) || null;
+    const ready = fs.existsSync(path.join(runtime, '.pocket-ready')) && executable(binary);
+    return { ready, step, failed, updated, tail, binary: ready ? binary : null };
+  };
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -93,9 +110,10 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
       if (method === 'POST' && parts[1] === 'providers' && parts[2] === 'models') result = await listModels(connectionSettings(body));
-      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.6.2', platform: process.platform, arch: process.arch,
+      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.6.3', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
+      else if (method === 'GET' && parts[1] === 'engine') result = engineStatus();
       else if (method === 'POST' && parts[1] === 'attach') result = attachFile(body);
       else if (method === 'GET' && parts[1] === 'shortcuts') result = { items: await workspaces.shortcuts((url.searchParams.get('external') || '').split('\n')) };
       else if (method === 'POST' && parts[1] === 'workspace-check') result = await workspaces.validate(body.path);

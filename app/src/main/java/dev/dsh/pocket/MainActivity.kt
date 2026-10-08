@@ -538,6 +538,28 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                     Text(if (state.connecting) tr("正在连接…") else if (state.connected && needsUpdate) tr("更新本地服务") else if (state.connected) tr("刷新状态") else tr("启动本地服务"))
                 }
                 if (state.connected && needsUpdate) Text(tr("本地服务版本落后，将自动更新。更新会结束终端连接，保留工作区和对话记录。"), style = MaterialTheme.typography.bodySmall)
+                // Termux names its own requirements precisely. Repeating the one it
+                // actually named, with the command attached, is the difference between an
+                // error message and a next step.
+                if (result.contains("allow-external-apps", ignoreCase = true)) {
+                    Text(tr("Termux 拒绝了命令：它内部的 allow-external-apps 开关没有打开。"),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    Text(permissionCommand, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(onClick = {
+                        (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText(tr("Termux 配置"), permissionCommand))
+                        safe { TermuxConnection.openApp(context) }
+                    }) { Text(tr("复制命令并打开 Termux")) }
+                }
+                // Termux refuses background sessions without its own overlay permission,
+                // and that refusal is what a first run sees as "nothing happened".
+                val overlay by TermuxConnection.overlay.collectAsStateWithLifecycle()
+                LaunchedEffect(result) { TermuxConnection.refreshOverlay(context) }
+                if (!overlay) {
+                    Text(tr("Termux 还需要「显示在其他应用上层」权限，否则它不会在后台启动会话。"),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    OutlinedButton(onClick = { safe { TermuxConnection.overlaySettings(context) } }) { Text(tr("打开 Termux 权限设置")) }
+                }
                 var details by remember { mutableStateOf(false) }
                 TextButton(onClick = { details = !details }) { Text(tr("运行详情")) }
                 if (details && result.isNotBlank()) Text(result, style = MaterialTheme.typography.bodySmall,
@@ -570,6 +592,29 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                 var maintenance by remember { mutableStateOf(false) }
                 if (state.health?.string("dsh").isNullOrBlank()) {
                     Button(onClick = { safe { TermuxConnection.installEngine(context) } }, enabled = state.connected) { Text(tr("安装引擎")) }
+                    // Without this the engine row said only "no engine" while a silent
+                    // Termux was in fact still installing, or had stopped at a step.
+                    val tail = state.engine?.optJSONArray("tail")?.let { array ->
+                        (0 until array.length()).joinToString("\n") { array.optString(it) }
+                    }.orEmpty()
+                    val step = state.engine?.string("step")
+                    when {
+                        state.engine?.optBoolean("failed") == true -> Text(tr("上次安装失败，日志末尾如下："), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                        !step.isNullOrBlank() -> Text(tr("安装进行到这里：") + step, style = MaterialTheme.typography.bodySmall)
+                        else -> Text(tr("安装日志会在这里显示进度。"), style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (tail.isNotBlank()) {
+                        var showLog by remember { mutableStateOf(false) }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { showLog = !showLog }) { Text(if (showLog) tr("收起日志") else tr("查看安装日志")) }
+                            TextButton(onClick = { model.refreshEngine() }) { Text(tr("刷新进度")) }
+                        }
+                        if (showLog) Text(tail, style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()))
+                    } else {
+                        TextButton(onClick = { model.refreshEngine() }) { Text(tr("刷新进度")) }
+                    }
+                    LaunchedEffect(state.health?.string("version")) { model.refreshEngine() }
                 } else {
                     TextButton(onClick = { maintenance = !maintenance }) { Text(tr("维护选项")) }
                     if (maintenance) {
