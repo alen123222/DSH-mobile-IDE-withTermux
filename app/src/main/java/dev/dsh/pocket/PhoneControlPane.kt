@@ -19,6 +19,11 @@ fun PhoneControlPane() {
     // The binding can change while this pane is on screen (or before it opens),
     // so check the socket whenever it appears rather than trusting a callback.
     LaunchedEffect(Unit) { PhoneControl.refresh() }
+    // Optional capability. The listener is registered once and also reports the state it
+    // finds, so the row is correct whether Shizuku was granted earlier or just now.
+    val shizuku by ShizukuShot.granted.collectAsState()
+    val shizukuRunning by ShizukuShot.running.collectAsState()
+    LaunchedEffect(Unit) { ShizukuShot.observe(context) }
     var expanded by remember { mutableStateOf(false) }
     var allowed by remember { mutableStateOf(PhoneControl.allowed) }
     val apps = remember {
@@ -36,6 +41,17 @@ fun PhoneControlPane() {
             else -> tr("开启无障碍服务后，可以读取和操作允许的应用。")
         })
         if (!connected) OutlinedButton(onClick = { PhoneControl.openSettings(context) }) { Text(if (listed) tr("重新开启无障碍服务") else tr("开启无障碍服务")) }
+        // Screen capture through the shell user has no multi-window restriction, which is
+        // what stops screenshots of apps that expose no controls.
+        OutlinedButton(onClick = { ShizukuShot.request(context) }, enabled = shizukuRunning && !shizuku) {
+            Text(when {
+                shizuku -> tr("Shizuku 已授权 · 精确截图")
+                shizukuRunning -> tr("授权 Shizuku（更好的截图）")
+                else -> tr("Shizuku 未运行")
+            })
+        }
+        if (!shizuku) Text(tr("Shizuku 是可选的：运行它之后，截图改由 shell 用户执行，不再受「只能有一个窗口」和空白界面树的限制。"),
+            style = MaterialTheme.typography.bodySmall)
         TextButton(onClick = { expanded = !expanded }) { Text("允许的应用 · ${allowed.size} ▾") }
         if (expanded) Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
             apps.forEach { (pkg, label) ->

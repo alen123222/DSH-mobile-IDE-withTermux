@@ -17,7 +17,7 @@ android {
         versionName = "0.6.2-dev"
         testInstrumentationRunner = "dev.dsh.pocket.ProviderSmokeInstrumentation"
     }
-    buildFeatures { compose = true; buildConfig = true }
+    buildFeatures { compose = true; buildConfig = true; aidl = true }
     signingConfigs.getByName("debug") { storeFile = rootProject.file(".cache/debug.keystore") }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -47,5 +47,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Optional: when the user runs Shizuku, screenshots come from screencap as the shell
+    // user, which is not subject to the multi-window limits of AccessibilityService.
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    // Supplies rikka.shizuku.ShizukuProvider, which is how the binder arrives.
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

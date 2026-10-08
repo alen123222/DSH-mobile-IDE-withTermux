@@ -45,6 +45,8 @@ class PocketAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         PhoneControl.load(this)
+        // Bind Shizuku before it is needed: the tools call this service, not the UI.
+        ShizukuShot.observe(this)
         if (Build.VERSION.SDK_INT >= 33) {
             serviceInfo = serviceInfo.apply {
                 flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
@@ -224,7 +226,9 @@ class PocketAccessibilityService : AccessibilityService() {
                         if (wasDriving) PhoneControl.returnToApp(this)
                         finish(JSONObject().put("ok", true))
                     }
-                    "state" -> finish(JSONObject().put("ok", true).put("apps", JSONArray(PhoneControl.allowed.toList())))
+                    "state" -> finish(JSONObject().put("ok", true).put("apps", JSONArray(PhoneControl.allowed.toList()))
+                        .put("shizuku", ShizukuShot.granted.value)
+                        .put("preciseScreenshot", ShizukuShot.granted.value))
                     "launch" -> finish(launch(args))
                     "screenshot" -> capture(credential, finish)
                     else -> {
@@ -448,18 +452,73 @@ class PocketAccessibilityService : AccessibilityService() {
         if (!dispatched) finish(JSONObject().put("ok", false).put("error", "The system rejected the gesture"))
     }
 
+    /**
+     * The package of the app in front, read from the window list rather than the tree:
+     * an app that exposes no controls still reports which window it owns, which is what
+     * makes screenshots of those apps possible at all.
+     */
+    private fun foregroundPackage(): String =
+        windows.lastOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }?.root?.packageName?.toString()
+            ?: rootInActiveWindow?.packageName?.toString().orEmpty()
+
     private fun capture(credential: String, finish: (JSONObject) -> Unit) {
-        if (Build.VERSION.SDK_INT < 30) { finish(JSONObject().put("ok", false).put("error", "Screenshots require Android 11")); return }
-        // The work notice is a window of this app, and a capture that sees two apps is
-        // refused. Take it down, let the window actually go, capture, then put it back.
+        val pkg = foregroundPackage()
+        if (pkg !in PhoneControl.allowed) {
+            finish(JSONObject().put("ok", false).put("error", "Foreground app is not allowed: $pkg"))
+            return
+        }
+        // The work notice belongs to this app, so it both trips the multi-window rule and
+        // would appear in the picture. Take it down, capture, then put it back.
         val notice = pill != null
         hidePill()
-        main.postDelayed({
-            captureFrame(credential, revision.get()) { result ->
-                if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
-                finish(result)
-            }
-        }, 150)
+        // screencap runs as the shell user and is not subject to the multi-window rules
+        // that make the accessibility capture refuse on apps that expose nothing.
+        if (ShizukuShot.granted.value) {
+            Thread({
+                val bytes = ShizukuShot.capture(this)
+                val result = bytes?.let { raw ->
+                    runCatching {
+                        android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.size)?.let { encode(it, pkg) }
+                    }.getOrNull()
+                }
+                main.post {
+                    if (result != null) {
+                        if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
+                        finish(result)
+                    } else {
+                        captureAccessibility(credential, notice, finish)
+                    }
+                }
+            }, "pocket-shot").start()
+            return
+        }
+        main.postDelayed({ captureAccessibility(credential, notice, finish) }, 150)
+    }
+
+    /** The fallback for devices that do not run Shizuku. */
+    private fun captureAccessibility(credential: String, notice: Boolean, finish: (JSONObject) -> Unit) {
+        if (Build.VERSION.SDK_INT < 30) {
+            finish(JSONObject().put("ok", false).put("error", "Screenshots need Android 11 or a running Shizuku"))
+            return
+        }
+        captureFrame(credential, revision.get()) { result ->
+            if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
+            finish(result)
+        }
+    }
+
+    /** Scales, compresses and packages one frame for the model. */
+    private fun encode(source: Bitmap, pkg: String): JSONObject {
+        val bitmap = source.copy(Bitmap.Config.ARGB_8888, false)
+        val width = bitmap.width
+        val height = bitmap.height
+        val ratio = minOf(1f, 1440f / maxOf(bitmap.width, bitmap.height))
+        val small = Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
+        val output = ByteArrayOutputStream(); small.compress(Bitmap.CompressFormat.JPEG, 85, output)
+        if (small !== bitmap) small.recycle()
+        bitmap.recycle()
+        return JSONObject().put("ok", true).put("width", width).put("height", height).put("input", inputStatus(pkg))
+            .put("imageBase64", android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP))
     }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
@@ -491,16 +550,7 @@ class PocketAccessibilityService : AccessibilityService() {
                 try {
                     check(PhoneControl.authorized(credential) && at == revision.get()) { "The screen changed while capturing; retry" }
                     val source = Bitmap.wrapHardwareBuffer(value.hardwareBuffer, value.colorSpace) ?: error("Empty screenshot")
-                    val bitmap = source.copy(Bitmap.Config.ARGB_8888, false); source.recycle()
-                    val width = bitmap.width
-                    val height = bitmap.height
-                    val ratio = minOf(1f, 1440f / maxOf(bitmap.width, bitmap.height))
-                    val small = Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
-                    val output = ByteArrayOutputStream(); small.compress(Bitmap.CompressFormat.JPEG, 85, output)
-                    if (small !== bitmap) small.recycle()
-                    bitmap.recycle()
-                    finish(JSONObject().put("ok", true).put("width", width).put("height", height).put("input", inputStatus(pkg))
-                        .put("imageBase64", android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)))
+                    try { finish(encode(source, pkg)) } finally { source.recycle() }
                 } catch (e: Exception) { finish(JSONObject().put("ok", false).put("error", e.message)) }
                 finally { value.hardwareBuffer.close() }
             }

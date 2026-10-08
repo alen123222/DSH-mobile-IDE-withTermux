@@ -1,10 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The bridge is plain HTTP on loopback and a user may point a preset at an HTTP
+     endpoint, so cleartext stays permitted. The domain-config that used to repeat this
+     for localhost was redundant, and its presence made the system refuse to initialise
+     any additional process of this app with "multiple conflicting per-domain rules". -->
 <network-security-config>
-    <!-- Custom API presets may intentionally use local/LAN HTTP endpoints.
-         The terminal WebView independently blocks every network resource. -->
     <base-config cleartextTrafficPermitted="true" />
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
 </network-security-config>
