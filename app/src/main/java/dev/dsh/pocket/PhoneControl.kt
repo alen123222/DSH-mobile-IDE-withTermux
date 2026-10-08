@@ -77,25 +77,6 @@ object PhoneControl {
         try { context.startActivity(intent) } catch (_: Exception) { /* The system may refuse. */ }
     }
 
-    private const val CHANNEL = "phone-control"
-    private const val NOTICE = 41
-    @SuppressLint("MissingPermission")
-    fun notifyWorking(context: Context, text: String) {
-        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(NotificationChannel(CHANNEL, tr("手机控制"), NotificationManager.IMPORTANCE_LOW))
-        }
-        if (!androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()) return
-        val notice = androidx.core.app.NotificationCompat.Builder(context, CHANNEL)
-            .setSmallIcon(context.applicationInfo.icon)
-            .setContentTitle(tr("DSH 正在操作手机"))
-            .setContentText(text.ifBlank { tr("任务结束后会自动回到 DSH") })
-            .setOngoing(true).setSilent(true).setOnlyAlertOnce(true).build()
-        try { androidx.core.app.NotificationManagerCompat.from(context).notify(NOTICE, notice) } catch (_: Exception) { }
-    }
-    fun clearWorking(context: Context) {
-        try { androidx.core.app.NotificationManagerCompat.from(context).cancel(NOTICE) } catch (_: Exception) { }
-    }
     /**
      * What matters to the user is whether the service is actually answering, and
      * the bound-service callback is not a dependable way to know: Android can

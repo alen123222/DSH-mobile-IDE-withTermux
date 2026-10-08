@@ -429,7 +429,6 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         lastStatus = status
         if (previous != "running" || status == "running") return
         val context = getApplication<Application>()
-        PhoneControl.clearWorking(context)
         if (PhoneControl.enabled.value) PhoneControl.returnToApp(context)
     }
     private fun accepts(current: JSONObject?, incoming: JSONObject): Boolean =

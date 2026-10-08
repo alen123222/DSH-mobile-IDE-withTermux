@@ -220,7 +220,7 @@ class PocketAccessibilityService : AccessibilityService() {
                         // Only pull the app forward if this run really drove the phone;
                         // a turn that never touched it should not steal focus back.
                         val wasDriving = pill != null
-                        hidePill(); PhoneControl.clearWorking(this)
+                        hidePill()
                         if (wasDriving) PhoneControl.returnToApp(this)
                         finish(JSONObject().put("ok", true))
                     }
