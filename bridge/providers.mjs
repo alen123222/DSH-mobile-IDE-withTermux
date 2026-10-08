@@ -45,7 +45,12 @@ export function modelLimits(input) {
     maxTokens: clamp(input.maxTokens, 8192, 256, 131072) };
 }
 
-export const connectionSignature = settings => crypto.createHash('sha256').update(JSON.stringify(settings)).digest('hex');
+// Process fingerprint. Bumped whenever anything baked into a running engine changes:
+// the generated patch, or the environment it is spawned with. A live engine is reused
+// across turns, so without a bump a shipped fix keeps failing until the app restarts.
+const PATCH_REVISION = 3;
+export const connectionSignature = settings => crypto.createHash('sha256')
+  .update(JSON.stringify({ patch: PATCH_REVISION, settings })).digest('hex');
 
 export function writeProviderPatch(stateDir, id, settings) {
   const dir = path.join(stateDir, 'provider-patches');
@@ -64,11 +69,24 @@ export function writeProviderPatch(stateDir, id, settings) {
     : [{ id: 'llm-deepseek', disabled: true }, { insert: [{ id: 'pocket-llm', name: '@deepseek-ai/dsh-llm-pi-ai', config: {
       providers: { 'pocket-openai': { displayName: t('Pocket 自定义 API'), apiKeyEnv: 'POCKET_API_KEY',
         api: settings.protocol === 'openai-responses' ? 'openai-responses' : 'openai-completions', baseURL: settings.baseUrl,
-        models: [{ ...model, input: settings.vision ? ['text', 'image'] : ['text'] }], ...(effort ? { reasoning: effort } : {}), retryPolicy: { mode: 'normal', maxRetries: 1 } } }
+        models: [{ ...model, input: ['text', 'image'] }], ...(effort ? { reasoning: effort } : {}), retryPolicy: { mode: 'normal', maxRetries: 1 } } }
     } }] }];
+  // The attachment store is needed whenever a prompt can carry a picture, which is
+  // independent of phone control; without it the engine refuses an image block with
+  // "SDK image prompt requires an attachment store".
+  // Keep attachment storage beside the engine's sessions. Android ancestor fsync
+  // and immutable publication are handled by the checked runtime attachment patch.
+  patch.push({ insert: [{
+    id: 'pocket-attachments', name: '@deepseek-ai/dsh-attachment-local',
+    config: { dshHome: path.join(stateDir, 'dsh-home') },
+  }] });
   if (settings.phone) patch.push({ insert: [
-    { id: 'pocket-attachments', name: '@deepseek-ai/dsh-attachment-local' },
     { id: 'pocket-phone', name: fileURLToPath(new URL('./phone-plugin.mjs', import.meta.url)) },
+  ] });
+  patch.push({ insert: [
+    { id: 'pocket-token-meter', name: '@deepseek-ai/dsh-token-meter' },
+    { id: 'pocket-session-stats', name: '@deepseek-ai/dsh-session-stats' },
+    { id: 'pocket-metrics', name: fileURLToPath(new URL('./metrics-plugin.mjs', import.meta.url)) },
   ] });
   const file = path.join(dir, `${id}.json`);
   fs.writeFileSync(file, JSON.stringify(patch, null, 2), { mode: 0o600 });

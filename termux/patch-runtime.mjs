@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { sdkSessionPatchPlan } from './sdk-session-patch.mjs';
+import { ensureAttachmentPatch } from './attachment-patch.mjs';
 
 const runtime = path.resolve(process.argv[2]);
 const require = createRequire(path.join(runtime, 'package.json'));
@@ -100,3 +101,4 @@ for (const file of [path.join(system, 'lib/flock.js'), sessionFile, inspectors[0
 }
 fs.writeFileSync(auditFile, JSON.stringify({ dsh: '0.2.0-rc.2', port: '0.1.0', files: [...audit.values()] }, null, 2));
 console.log(`Applied ${plans.length} verified Android source changes.`);
+ensureAttachmentPatch(runtime);

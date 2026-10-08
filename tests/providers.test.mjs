@@ -6,7 +6,7 @@ import path from 'node:path';
 import { connectionSettings, connectionSignature, listModels, modelRoots, writeProviderPatch } from '../bridge/providers.mjs';
 import http from 'node:http';
 
-test('phone capabilities require a bounded token, enable tools explicitly, and preserve text-only defaults', () => {
+test('phone tools require a bounded token while image attachments work without phone control', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocket-phone-'));
   try {
     const basic = connectionSettings({ protocol: 'openai-chat', model: 'test' });
@@ -14,11 +14,13 @@ test('phone capabilities require a bounded token, enable tools explicitly, and p
     assert.notEqual(connectionSignature(basic), connectionSignature(phone));
     assert.equal(connectionSettings({ ...basic, phone: { token: 'short', port: 80 } }).phone, undefined);
     const plain = JSON.parse(fs.readFileSync(writeProviderPatch(root, 'plain', basic)));
-    assert.deepEqual(plain[1].insert[0].config.providers['pocket-openai'].models[0].input, ['text']);
+    assert.deepEqual(plain[1].insert[0].config.providers['pocket-openai'].models[0].input, ['text', 'image']);
+    assert.ok(plain.flatMap(row => row.insert || []).some(row => row.id === 'pocket-attachments' && row.config.dshHome === path.join(root, 'dsh-home')));
+    assert.equal(plain.flatMap(row => row.insert || []).some(row => row.id === 'pocket-phone'), false);
     const patch = JSON.parse(fs.readFileSync(writeProviderPatch(root, 'phone', phone)));
     assert.deepEqual(patch[1].insert[0].config.providers['pocket-openai'].models[0].input, ['text', 'image']);
-    assert.ok(patch.at(-1).insert.some(row => row.id === 'pocket-phone'));
-    assert.ok(patch.at(-1).insert.some(row => row.id === 'pocket-attachments'));
+    assert.ok(patch.flatMap(row => row.insert || []).some(row => row.id === 'pocket-phone'));
+    assert.ok(patch.flatMap(row => row.insert || []).some(row => row.id === 'pocket-attachments'));
     assert.equal(JSON.stringify(patch).includes(phone.phone.token), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

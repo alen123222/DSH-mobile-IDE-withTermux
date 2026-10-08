@@ -53,6 +53,26 @@ async function bodyOf(request) {
   } catch { throw new ApiError(400, t('无效的 JSON 请求')); }
 }
 
+/**
+ * Store one attachment the user picked inside the workspace it belongs to, so the
+ * model can open it with the file tools it already has. Images normally travel as
+ * content blocks instead; this is for everything else.
+ */
+function attachFile(body) {
+  const root = path.resolve(String(body.workspacePath || ''));
+  if (!root || root === path.parse(root).root) throw new ApiError(400, t('请先选择工作区'));
+  const name = String(body.name || 'file').replace(/[^\w.-]+/g, '_').slice(-80) || 'file';
+  const data = Buffer.from(String(body.data || ''), 'base64');
+  if (data.length === 0) throw new ApiError(400, t('附件为空'));
+  if (data.length > 6 * 1024 * 1024) throw new ApiError(400, t('附件过大，请压缩后再发送'));
+  const dir = path.join(root, '.dsh-attachments');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let target = path.join(dir, name);
+  for (let n = 1; fs.existsSync(target) && n < 100; n += 1) target = path.join(dir, n + '-' + name);
+  fs.writeFileSync(target, data, { mode: 0o600 });
+  return { path: target, bytes: data.length };
+}
+
 export function createBridge({ stateDir, token, dshOptions = {} }) {
   if (typeof token !== 'string' || token.length < 32) throw new Error('Bridge token must contain at least 32 characters');
   const workspaces = new Workspaces(stateDir, dshOptions), terminals = new Terminals(), chats = new DshSessions(stateDir, dshOptions);
@@ -73,9 +93,10 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
       if (method === 'POST' && parts[1] === 'providers' && parts[2] === 'models') result = await listModels(connectionSettings(body));
-      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.5.4', platform: process.platform, arch: process.arch,
+      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.6.2', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
+      else if (method === 'POST' && parts[1] === 'attach') result = attachFile(body);
       else if (method === 'GET' && parts[1] === 'shortcuts') result = { items: await workspaces.shortcuts((url.searchParams.get('external') || '').split('\n')) };
       else if (method === 'POST' && parts[1] === 'workspace-check') result = await workspaces.validate(body.path);
       else if (method === 'GET' && parts[1] === 'browse') result = await workspaces.browse(url.searchParams.get('path') || undefined, url.searchParams.get('dirs') === 'true');

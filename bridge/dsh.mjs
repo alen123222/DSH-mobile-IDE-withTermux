@@ -7,6 +7,8 @@ import { ApiError, text, writeJson, readJson, executable, killProcessTree } from
 import { connectionSettings, connectionSignature, writeProviderPatch } from './providers.mjs';
 import { t } from './i18n.mjs';
 import { ensureSdkSessionPatch } from '../termux/sdk-session-patch.mjs';
+import { ensureAttachmentPatch } from '../termux/attachment-patch.mjs';
+import { readMetrics } from './metrics.mjs';
 
 // Matches DSH 0.2.0-rc.2's SDK protocol. Every process has one immutable cwd.
 // The SDK has no approval-response or cancel method; execution consent is
@@ -140,8 +142,8 @@ export class DshSessions {
     return value;
   }
   snapshot(item) {
-    const { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred } = item;
-    return { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred: starred === true };
+    const { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred, metrics } = item;
+    return { id, workspaceId, cwd, title, messages, events, seq, status, revision, createdAt, error, starred: starred === true, metrics };
   }
   list(workspaceId) {
     return [...this.sessions.values()].filter(s => !workspaceId || s.workspaceId === workspaceId)
@@ -223,7 +225,10 @@ export class DshSessions {
     if (!binary) throw new ApiError(409, t('尚未安装 DSH，请先在环境页安装引擎'));
     if (process.platform === 'win32' && !this.options.command) throw new ApiError(501, t('此启动器面向 Termux；电脑端仅运行协议测试'));
     const runtime = path.join(this.stateDir, 'runtime');
-    if (!this.options.command && path.resolve(binary) === path.join(runtime, 'bin', 'dsh-pocket')) ensureSdkSessionPatch(runtime);
+    if (!this.options.command && path.resolve(binary) === path.join(runtime, 'bin', 'dsh-pocket')) {
+      ensureSdkSessionPatch(runtime);
+      ensureAttachmentPatch(runtime);
+    }
     item.apiKey = settings.apiKey || '';
     item.phoneToken = settings.phone?.token || '';
     item.phonePort = settings.phone?.port || 0;
@@ -234,12 +239,17 @@ export class DshSessions {
     const home = path.join(this.stateDir, 'dsh-home');
     fs.mkdirSync(home, { recursive: true, mode: 0o700 });
     const env = { ...process.env, DSH_HOME: home };
+    // Node falls back to getpwuid() when HOME is missing, and on Android an app uid has
+    // no passwd entry, so homedir() answers /data/data — anything resolving ~/.dsh then
+    // opens /data/data and fails with EACCES. Set it unconditionally: a bridge started by
+    // the app can carry an environment the engine must not inherit.
+    env.HOME = path.resolve(this.stateDir, '../../..');
     env.POCKET_API_KEY = item.apiKey;
     if (settings.phone) {
       env.POCKET_RUNTIME = runtime;
       env.POCKET_PHONE_TOKEN = settings.phone.token;
       env.POCKET_PHONE_PORT = String(settings.phone.port);
-      env.POCKET_PHONE_VISION = settings.vision ? '1' : '0';
+      env.POCKET_PHONE_VISION = '1';
     }
     const [command, ...args] = this.options.command || [binary, '--profile', 'sdk-minimal'];
     args.push('--patch', writeProviderPatch(this.stateDir, item.id, settings));
@@ -300,6 +310,11 @@ export class DshSessions {
   notification(item, frame) {
     const params = frame.params;
     if (!params || params.sessionId !== item.id) return; // Child output must not replace the root answer.
+    if (frame.method === 'session.metrics') {
+      const metrics = readMetrics(params);
+      if (metrics && metrics.asOfSeq >= (item.metrics?.asOfSeq ?? -1)) { item.metrics = metrics; this.touch(item); }
+      return;
+    }
     if (item.status !== 'running') return;
     if (!item.receipt) {
       if (item.notificationBuffer.length >= 10000) throw new Error(t('DSH 回执前事件过多'));
@@ -379,7 +394,17 @@ export class DshSessions {
       try {
         if (!item.process) await this.start(item, body);
         if (!live() || item.status !== 'running') return;
-        const response = await this.request(item, 'session/prompt', { sessionId: item.id, contentBlocks: [{ type: 'text', text: body.prompt }] });
+        // Images travel as their own content blocks, which is what the desktop client
+        // does when a picture is pasted into the prompt. Anything else is refused here
+        // rather than handed to the engine as an unreadable block.
+        const blocks = [{ type: 'text', text: body.prompt }];
+        for (const file of Array.isArray(body.attachments) ? body.attachments.slice(0, 4) : []) {
+          const mimeType = String(file?.mimeType || '');
+          if (typeof file?.data !== 'string' || !/^image\/(png|jpeg|webp|gif)$/.test(mimeType)) continue;
+          if (file.data.length > 6 * 1024 * 1024) throw new ApiError(400, t('图片过大，请压缩后再发送'));
+          blocks.push({ type: 'image', data: file.data, mimeType });
+        }
+        const response = await this.request(item, 'session/prompt', { sessionId: item.id, contentBlocks: blocks });
         if (!live()) return;
         item.receipt = text(response?.messageId, t('DSH 消息回执'));
         const buffered = item.notificationBuffer.splice(0);
