@@ -23,6 +23,12 @@ import java.util.UUID
 /** A well-known starting point, with whether this Termux can actually read it. */
 data class Shortcut(val label: String, val path: String, val available: Boolean, val reason: String = "")
 
+/**
+ * A file the user picked. Images carry base64 and travel as picture blocks; anything
+ * else carries the path it was stored at inside the workspace.
+ */
+data class Attachment(val name: String, val mimeType: String, val data: String = "", val path: String = "")
+
 data class PocketState(
     val connected: Boolean = false, val connecting: Boolean = false, val health: JSONObject? = null,
     val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
@@ -30,7 +36,7 @@ data class PocketState(
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
     val shortcuts: List<Shortcut> = emptyList(), val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
     val settings: EngineSettings = EngineSettings(), val error: String? = null, val viewer: OpenFile? = null,
-    val terminalId: String? = null,
+    val terminalId: String? = null, val pendingAttachments: List<Attachment> = emptyList(),
     val presets: List<ApiPreset> = emptyList(), val activePresetId: String = "",
     val discovered: List<String> = emptyList(), val probing: Boolean = false,
 )
@@ -70,6 +76,48 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun clearDiscovered() = mutable.update { it.copy(discovered = emptyList()) }
+    fun removeAttachment(name: String) = mutable.update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { file -> file.name == name }) }
+    fun clearAttachments() = mutable.update { it.copy(pendingAttachments = emptyList()) }
+    /**
+     * Images are shrunk and handed over as pictures. Everything else is written into
+     * the workspace and passed as a path, which the model reads with the tools it
+     * already has — cheaper than pushing a whole file through the conversation.
+     */
+    fun attach(context: android.content.Context, uri: android.net.Uri) = task {
+        val resolver = context.contentResolver
+        val name = resolver.query(uri, null, null, null, null)?.use { cursor ->
+            val column = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (column >= 0 && cursor.moveToFirst()) cursor.getString(column) else null
+        } ?: "file"
+        val type = resolver.getType(uri) ?: "application/octet-stream"
+        val bytes = withContext(Dispatchers.IO) {
+            runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+        } ?: return@task error(tr("无法读取这个文件"))
+        if (type.startsWith("image/")) {
+            val encoded = withContext(Dispatchers.IO) { compressImage(bytes) } ?: return@task error(tr("无法读取这张图片"))
+            mutable.update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { file -> file.name == name } + Attachment(name, "image/jpeg", encoded)) }
+            return@task
+        }
+        val workspace = state.value.selected?.path ?: return@task error(tr("请先选择工作区"))
+        val stored = withContext(Dispatchers.IO) {
+            api.call("attach", "POST", JSONObject().put("workspacePath", workspace).put("name", name)
+                .put("data", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)))
+        }
+        mutable.update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { file -> file.name == name } + Attachment(name, type, path = stored.string("path"))) }
+    }
+    /** Long edge 1600px and quality stepped down until it fits comfortably in one request. */
+    private fun compressImage(bytes: ByteArray): String? = runCatching {
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val ratio = minOf(1f, 1600f / maxOf(bitmap.width, bitmap.height))
+        val scaled = if (ratio < 1f) android.graphics.Bitmap.createScaledBitmap(bitmap,
+            (bitmap.width * ratio).toInt().coerceAtLeast(1), (bitmap.height * ratio).toInt().coerceAtLeast(1), true) else bitmap
+        val out = java.io.ByteArrayOutputStream()
+        var quality = 85
+        do { out.reset(); scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out); quality -= 15 } while (out.size() > 1_200_000 && quality >= 40)
+        if (scaled !== bitmap) scaled.recycle()
+        bitmap.recycle()
+        android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    }.getOrNull()
     /**
      * Where each transcript was left. The list state lives in the composition, so
      * without this a tab switch or a rotation dropped the reader back at the top.
@@ -441,18 +489,28 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         val chat = state.chat ?: return@task
         val settings = state.settings
         val phone = PhoneControl.grant()
+        val files = state.pendingAttachments
+        // Files already stored in the workspace are named in the message itself.
+        val message = buildString {
+            append(prompt)
+            files.filter { it.path.isNotBlank() }.forEach { append("\n\n附件：").append(it.path) }
+        }
+        val images = org.json.JSONArray().apply {
+            files.filter { it.data.isNotBlank() }.forEach { put(JSONObject().put("data", it.data).put("mimeType", it.mimeType)) }
+        }
         val value = withContext(Dispatchers.IO) {
-            api.call("chats/${chat.getString("id")}/prompt", "POST", JSONObject().put("prompt", prompt)
+            api.call("chats/${chat.getString("id")}/prompt", "POST", JSONObject().put("prompt", message)
                 .put("model", settings.model).put("provider", settings.route).put("apiKey", settings.apiKey)
                 .put("protocol", settings.protocol).put("autoVersion", settings.autoVersion)
                 .put("contextWindow", settings.contextWindow).put("maxTokens", settings.maxTokens)
                 .put("reasoningEffort", settings.reasoningEffort)
                 .put("phone", phone).put("vision", settings.vision)
-                .put("baseUrl", settings.baseUrl).put("allowExecution", true))
+                .put("baseUrl", settings.baseUrl).put("allowExecution", true).put("attachments", images))
         }
         mutable.update { state -> if (accepts(state.chat, value)) state.copy(chat = value) else state }
         // The accessibility service keeps a small overlay in front of whatever app it
         // drives; nothing has to be pulled down to see that DSH is working.
+        clearAttachments()
     }
     fun stop() = task {
         // Stopping kills the engine, so no turn/end will arrive to retract the notice.

@@ -16,6 +16,7 @@ import java.util.UUID
 
 /** The capability is memory-only: process death, Stop, or switching it off revokes it. */
 object PhoneControl {
+    val inputGuard = PhoneInputGuard()
     val connected = MutableStateFlow(false)
     val enabled = MutableStateFlow(false)
     @Volatile private var token = ""
@@ -45,6 +46,7 @@ object PhoneControl {
         token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
         expires = SystemClock.elapsedRealtime() + 30 * 60 * 1000
         spent = 0; lastAction = ""; repeats = 0
+        inputGuard.reset()
         return JSONObject().put("token", token).put("port", BuildConfig.BRIDGE_PORT + 1)
     }
     fun authorized(candidate: String) = enabled.value && candidate.isNotEmpty() && candidate == token && SystemClock.elapsedRealtime() < expires

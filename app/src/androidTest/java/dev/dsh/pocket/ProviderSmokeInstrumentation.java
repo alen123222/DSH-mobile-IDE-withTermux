@@ -12,7 +12,8 @@ import java.util.List;
 /** Runs against a loopback fake API, never the user's saved connection. */
 public class ProviderSmokeInstrumentation extends Instrumentation {
     private boolean phoneTest;
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); phoneTest = "true".equals(arguments.getString("phone")); start(); }
+    private boolean wechatTest;
+    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); phoneTest = "true".equals(arguments.getString("phone")); wechatTest = "true".equals(arguments.getString("wechat")); start(); }
     private void require(boolean value, String message) { if (!value) throw new AssertionError(message); }
     private EngineSettings settings(String protocol, String url, String key) {
         return new EngineSettings("pocket-test-model", "unused", key, url, protocol, true, 131072, 8192, protocol.equals("openai-responses") ? "high" : "low", false);
@@ -20,7 +21,7 @@ public class ProviderSmokeInstrumentation extends Instrumentation {
     @Override public void onStart() {
         if (phoneTest) {
             Bundle output = new Bundle();
-            try { output.putString("result", PhoneSmoke.run(this)); finish(Activity.RESULT_OK, output); }
+            try { output.putString("result", PhoneSmoke.run(this, wechatTest)); finish(Activity.RESULT_OK, output); }
             catch (Throwable e) { output.putString("error", android.util.Log.getStackTraceString(e)); finish(Activity.RESULT_CANCELED, output); }
             return;
         }

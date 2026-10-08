@@ -34,6 +34,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Insights
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -99,9 +104,16 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
             Scaffold(containerColor = Surface, snackbarHost = { SnackbarHost(snackbar) }, topBar = {
                 TopAppBar(title = {
                     Column {
-                        Text(state.selected?.name ?: "DSH Pocket", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(if (state.connected) tr("● 本地已连接 · Termux") else tr("○ 等待连接 Termux"), style = MaterialTheme.typography.labelSmall,
-                            color = if (state.connected) Color(0xFF16835F) else MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(state.selected?.name ?: "DSH Pocket", fontWeight = FontWeight.SemiBold, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis)
+                            Text("  " + if (state.connected) tr("● Termux") else tr("○ 等待连接"),
+                                style = MaterialTheme.typography.labelSmall, maxLines = 1,
+                                color = if (state.connected) Color(0xFF16835F) else MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        // The figures are three buttons already, each opening its own
+                        // detail. Wrapping them in another chooser only added a tap.
+                        ChatStats(state.chat)
                     }
                 }, navigationIcon = { if (!wide) IconButton(onClick = { scope.launch { drawer.open() } }) { Icon(Icons.Outlined.Menu, tr("工作区与会话")) } },
                     actions = {
@@ -271,6 +283,10 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
     // was sent until the new turn produced its first card.
     val activeWork = if (running) timeline.lastOrNull { it is Timeline.Work && it.seq > lastUser }?.seq else null
     val chatId = chat.string("id")
+    val context = LocalContext.current
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) model.attach(context, uri)
+    }
     val listState = rememberLazyListState()
     // Returning to a transcript (a tab switch, a rotation) resumes where it was
     // left; opening a chat for the first time lands on the newest message. This
@@ -324,8 +340,17 @@ private fun ChatPane(state: PocketState, model: PocketModel, onSetup: () -> Unit
         // Every chat is continuable, including one restored from a previous run:
         // the engine keeps its sessions under DSH_HOME, so asking again resumes it.
         Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp).widthIn(max = 1000.dp).fillMaxWidth()) {
+            if (state.pendingAttachments.isNotEmpty()) Row(Modifier.padding(bottom = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                state.pendingAttachments.forEach { file ->
+                    InputChip(selected = false, onClick = { model.removeAttachment(file.name) },
+                        label = { Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        trailingIcon = { Icon(Icons.Outlined.Close, tr("移除附件"), Modifier.size(16.dp)) })
+                }
+            }
             OutlinedTextField(value = input, onValueChange = { input = it }, placeholder = { Text(tr("描述你想完成的任务…")) }, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 6,
-                shape = RoundedCornerShape(18.dp), trailingIcon = {
+                shape = RoundedCornerShape(18.dp),
+                leadingIcon = { IconButton(onClick = { picker.launch(arrayOf("*/*")) }) { Icon(Icons.Outlined.AttachFile, tr("添加附件"), tint = Color(0xFF64748B)) } },
+                trailingIcon = {
                     if (running) IconButton(onClick = model::stop) { Icon(Icons.Outlined.StopCircle, tr("停止任务"), tint = MaterialTheme.colorScheme.error) }
                     else IconButton(enabled = input.isNotBlank(), onClick = { model.send(input); input = "" }) { Icon(Icons.AutoMirrored.Outlined.Send, tr("发送"), tint = if (input.isNotBlank()) Blue else Color.Gray) }
                 })
@@ -465,6 +490,11 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
     // Compare against the real constant. A hardcoded "0.2.0" here made the button
     // read 更新本地服务 forever, even on a current service.
     val needsUpdate = state.health?.string("version") != BRIDGE_VERSION
+    var onboarding by remember { mutableStateOf(false) }
+    var permission by remember { mutableStateOf(false) }
+    // Termux owns its prompt: no app can type into it, so the one switch it needs is
+    // the only manual step, and this is that instruction.
+    val permissionCommand = "mkdir -p ~/.termux && echo \"allow-external-apps = true\" >> ~/.termux/termux.properties"
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Text(tr("本地环境"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Text(tr("DSH 和命令运行在手机上的完整 Termux 中。"), color = Color(0xFF64748B))
@@ -472,17 +502,25 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (state.connected) tr("● Termux 已连接") else tr("○ 完成首次连接"), fontWeight = FontWeight.SemiBold, color = if (state.connected) Color(0xFF16835F) else Blue)
                 if (!state.connected) {
-                    Text(tr("1. 允许本应用在 Termux 中运行命令。\n2. 复制配置命令，在 Termux 中执行一次。\n3. 安装基础环境，然后启动服务。"), style = MaterialTheme.typography.bodyMedium)
+                    Text(tr("首次连接会安装 Node/Python、写入配置并启动本地服务。Termux 有一个一次性开关需要你允许本应用运行命令。"),
+                        style = MaterialTheme.typography.bodyMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = grant) { Text(tr("授予权限")) }
-                        OutlinedButton(onClick = {
-                            (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(tr("Termux 配置"), TermuxConnection.setupCommand))
-                            safe { TermuxConnection.openApp(context) }
-                        }) { Text(tr("复制配置并打开 Termux")) }
+                        // This one acts. Termux refusing the command is the one failure a
+                        // first-time user hits, so it opens the instructions with the reason.
+                        Button(onClick = {
+                            runCatching { TermuxConnection.firstRun(context, model.token) }
+                                .onSuccess { safe { TermuxConnection.openApp(context) } }
+                                .onFailure { onboarding = true; permission = true }
+                        }) { Text(tr("一键完成首次连接")) }
+                        OutlinedButton(onClick = { onboarding = true; permission = true }) { Text(tr("需要什么权限？")) }
                     }
-                    OutlinedButton(onClick = { safe { TermuxConnection.installBase(context) } }) { Text(tr("安装 Node / Python")) }
                 }
-                Button(onClick = { model.connect() }, enabled = !state.connecting) {
+                Button(onClick = {
+                    // Starting the local service means Termux has to be up; on a cold
+                    // device a background command would run unseen.
+                    if (!state.connected) safe { TermuxConnection.openApp(context) }
+                    model.connect()
+                }, enabled = !state.connecting) {
                     if (state.connecting) { CircularProgressIndicator(Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)) }
                     Text(if (state.connecting) tr("正在连接…") else if (state.connected && needsUpdate) tr("更新本地服务") else if (state.connected) tr("刷新状态") else tr("启动本地服务"))
                 }
@@ -493,6 +531,25 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
                     modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState()))
             }
         }
+        if (onboarding) AlertDialog(onDismissRequest = { onboarding = false; permission = false },
+            title = { Text(tr("首次连接")) },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(tr("Termux 默认不允许其他应用运行命令，需要打开一次这个开关："))
+                Text(permissionCommand, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text(tr("把上面这行在 Termux 里执行一次，然后回到这里按「已设置，开始连接」——安装 Node/Python、写入配置、启动服务都会自动完成。"))
+            } },
+            confirmButton = { TextButton(onClick = {
+                (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                    .setPrimaryClip(ClipData.newPlainText(tr("Termux 配置"), permissionCommand))
+                safe { TermuxConnection.openApp(context) }
+            }) { Text(tr("复制命令并打开 Termux")) } },
+            dismissButton = { TextButton(onClick = {
+                onboarding = false; permission = false
+                // A silent failure here is what made this look like nothing happened.
+                runCatching { TermuxConnection.firstRun(context, model.token) }
+                    .onSuccess { safe { TermuxConnection.openApp(context) } }
+                    .onFailure { model.error(it.message ?: tr("Termux 没有接受命令")) }
+            }) { Text(tr("已设置，开始连接")) } })
         Surface(shape = RoundedCornerShape(18.dp), color = Color.White) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(tr("DSH 引擎"), fontWeight = FontWeight.SemiBold)

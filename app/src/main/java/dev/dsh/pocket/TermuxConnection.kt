@@ -100,6 +100,24 @@ object TermuxConnection {
         }
         run(context, script, true, tr("DSH Pocket 本地服务"))
     }
+    /**
+     * A first run in one Termux session: base packages, bridge assets, the connection
+     * file and the service itself. Termux owns its prompt, so no app can prefill a
+     * command for it — a single dispatched script is as close as the platform allows.
+     */
+    fun firstRun(context: Context, token: String) {
+        val script = buildString {
+            append("set -eu\n")
+            append("pkg install -y nodejs-lts python\n")
+            append(assetsScript(context, listOf("bridge", "termux")).asScriptBlock())
+            val config = JSONObject().put("token", token).put("port", BuildConfig.BRIDGE_PORT).toString()
+            val base64 = Base64.encodeToString(config.toByteArray(), Base64.NO_WRAP)
+            append("printf '%s' '$base64' | base64 -d > \"\$ROOT/connection.json\"\n")
+            append(guardScript(token))
+            append("export POCKET_HOME=\"\$ROOT\"\nexec node \"\$ROOT/bridge/server.mjs\"\n")
+        }
+        run(context, script, true, tr("首次连接"))
+    }
     fun upgrade(context: Context, token: String) {
         val script = buildString {
             append("set -eu\nexport POCKET_UPDATE_TOKEN='$token'\nnode --input-type=module <<'POCKET_UPDATE'\n")

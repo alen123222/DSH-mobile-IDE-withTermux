@@ -9,12 +9,38 @@ class PhoneFixtureActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        layout.addView(EditText(this).apply { contentDescription = "phone-test-input"; setText("initial") })
+        val agentTest = intent.getBooleanExtra("agenttest", false)
+        if (agentTest) {
+            layout.setPadding(40, 180, 40, 0)
+            layout.addView(TextView(this).apply { text = "中文输入测试"; textSize = 24f })
+        }
+        layout.addView(EditText(this).apply { tag = "phone-test-input"; contentDescription = "phone-test-input"; setText("initial") })
+        if (!agentTest) {
         layout.addView(EditText(this).apply { inputType = 129; contentDescription = "phone-test-password"; setText("private-marker") })
         layout.addView(Button(this).apply { text = "phone-test-button"; setOnClickListener { text = "phone-test-clicked" } })
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         repeat(70) { content.addView(TextView(this).apply { text = "phone-test-row-$it"; textSize = 24f; setPadding(12, 20, 12, 20) }) }
         layout.addView(ScrollView(this).apply { addView(content) })
+        }
         setContentView(layout)
+        if (intent.getBooleanExtra("agenttest", false)) Thread {
+            val output = try { PhoneAgentSmoke.run(this) }
+                catch (e: Throwable) { "FAIL: " + android.util.Log.getStackTraceString(e) }
+            java.io.File(filesDir, "phone-agent-test.txt").writeText(output)
+        }.start()
+        // Shell-only debug fixture runs in the existing process so instrumentation
+        // does not kill the bound accessibility service on device ROMs.
+        if (intent.getBooleanExtra("selftest", false)) Thread {
+            val output = try {
+                PhoneSmoke.run(this, { this }, { action ->
+                    val done = java.util.concurrent.CountDownLatch(1)
+                    var failure: Throwable? = null
+                    runOnUiThread { try { action.run() } catch (e: Throwable) { failure = e } finally { done.countDown() } }
+                    check(done.await(5, java.util.concurrent.TimeUnit.SECONDS)) { "UI test timed out" }
+                    failure?.let { throw it }
+                }, intent.getBooleanExtra("wechat", false))
+            } catch (e: Throwable) { "FAIL: " + android.util.Log.getStackTraceString(e) }
+            java.io.File(filesDir, "phone-selftest.txt").writeText(output)
+        }.start()
     }
 }

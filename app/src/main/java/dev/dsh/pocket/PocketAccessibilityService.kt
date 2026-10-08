@@ -12,6 +12,7 @@ import android.os.Looper
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -44,6 +45,11 @@ class PocketAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         PhoneControl.load(this)
+        if (Build.VERSION.SDK_INT >= 33) {
+            serviceInfo = serviceInfo.apply {
+                flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_EDITOR
+            }
+        }
         // Android can call this again for a service that is already bound. Binding
         // the port a second time fails, and the failure used to clear the flag while
         // the first socket kept serving, so the UI reported "not connected" for a
@@ -184,13 +190,26 @@ class PocketAccessibilityService : AccessibilityService() {
     private fun execute(args: JSONObject, credential: String): JSONObject {
         val done = CountDownLatch(1)
         var result = JSONObject().put("ok", false).put("error", "Operation timed out")
-        val finish: (JSONObject) -> Unit = { result = it; done.countDown() }
+        var attemptedInput = false
+        val finish: (JSONObject) -> Unit = {
+            if (attemptedInput) {
+                PhoneControl.inputGuard.inputResult(it.optBoolean("ok"))
+                if (!it.optBoolean("ok")) it.put("recovery", PhoneControl.inputGuard.blocked("type"))
+            }
+            if (it.optBoolean("ok") && (it.has("imageBase64") || it.optInt("count") > 0)) {
+                PhoneControl.inputGuard.observed()
+            }
+            result = it; done.countDown()
+        }
         main.post {
             try {
                 check(PhoneControl.authorized(credential)) { "Control revoked" }
                 val action = args.getString("action")
+                PhoneControl.inputGuard.blocked(action)?.let { message ->
+                    finish(JSONObject().put("ok", false).put("error", message)); return@post
+                }
                 if (action != "finished") showPill(tr("DSH 正在工作") + " · " + action)
-                PhoneControl.spend(action + " " + args.toString()).let { stop ->
+                (if (action == "finished") null else PhoneControl.spend(action + " " + args.toString())).let { stop ->
                     if (stop != null) { finish(JSONObject().put("ok", false).put("error", stop)); return@post }
                 }
                 when (action) {
@@ -215,7 +234,7 @@ class PocketAccessibilityService : AccessibilityService() {
                         when (action) {
                             "observe" -> finish(observe(root, pkg))
                             "tap" -> tap(root, args, finish)
-                            "type" -> finish(type(root, args))
+                            "type" -> { attemptedInput = true; finish(type(root, args)) }
                             "scroll" -> scroll(args, finish)
                             "key" -> {
                                 val key = args.getString("key")
@@ -278,6 +297,7 @@ class PocketAccessibilityService : AccessibilityService() {
         walk(root, 0)
         val observed = JSONObject().put("ok", true).put("package", pkg)
             .put("count", items.length()).put("truncated", truncated).put("nodes", items)
+            .put("input", inputStatus(pkg))
         // A bare empty list reads as "nothing is on screen". Apps that render
         // outside the accessibility tree (WeChat among them) really do expose
         // nothing, and the model needs to hear that rather than retry forever.
@@ -286,13 +306,41 @@ class PocketAccessibilityService : AccessibilityService() {
         return observed
     }
 
+    private fun inputStatus(pkg: String): JSONObject {
+        val available = Build.VERSION.SDK_INT >= 33 && inputMethod?.currentInputStarted == true &&
+            inputMethod?.currentInputEditorInfo?.packageName == pkg && inputMethod?.currentInputConnection != null
+        return JSONObject().put("nativeConnectionAvailable", available)
+            .put("instruction", "Enter the whole text with phone_type, including Chinese. It supports native input even when accessibility nodes are empty. Never type by tapping keyboard letters or using shell/clipboard commands. If no field is active, tap the app's text field first.")
+    }
+
+    private fun rejectKeyboardTap(x: Float, y: Float) {
+        val keyboard = windows.any { window ->
+            if (window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) false
+            else Rect().also { window.getBoundsInScreen(it) }.contains(x.toInt(), y.toInt())
+        }
+        if (keyboard) {
+            PhoneControl.inputGuard.inputResult(false)
+            error("Soft keyboard taps are disabled. Observe again, then use phone_type with the complete text (Chinese supported). Do not retry keyboard taps.")
+        }
+    }
+
     /** The tap lands where the target is *now*, not where it was when observed. */
     private fun tap(root: AccessibilityNodeInfo, args: JSONObject, finish: (JSONObject) -> Unit) {
+        val metrics = resources.displayMetrics
+        require(args.has("fx") == args.has("fy")) { "Supply both fx and fy" }
+        require(args.has("x") == args.has("y")) { "Supply both x and y" }
+        require(!(args.has("fx") && args.has("x"))) { "Use either fx/fy or x/y, not both" }
+        for ((key, extent) in listOf("fx" to metrics.widthPixels, "fy" to metrics.heightPixels,
+            "x" to metrics.widthPixels, "y" to metrics.heightPixels)) {
+            if (args.has(key)) phoneCoordinate(args.getDouble(key), extent, key.startsWith("f"))
+        }
         val text = args.optString("text").takeIf { it.isNotBlank() }
         val desc = args.optString("desc").takeIf { it.isNotBlank() }
         val labelled = if (text != null || desc != null) find(root, text, desc) else null
         if (labelled != null) {
             val match = nearestClickable(labelled) ?: labelled
+            val targetBounds = Rect().also { match.getBoundsInScreen(it) }
+            rejectKeyboardTap(targetBounds.exactCenterX(), targetBounds.exactCenterY())
             if (match.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 revision.incrementAndGet()
                 finish(JSONObject().put("ok", true).put("found", true).put("method", "text"))
@@ -303,37 +351,71 @@ class PocketAccessibilityService : AccessibilityService() {
                 .put("error", "Nothing on screen matches that text or description; observe again"))
             return
         }
-        val metrics = resources.displayMetrics
         val bounds = Rect()
         // A label with no clickable ancestor is still worth pressing at its centre.
         val fallback = labelled?.let { nearestClickable(it) ?: it }
         if (fallback != null) fallback.getBoundsInScreen(bounds)
         val x = when {
-            args.has("fx") -> (args.getDouble("fx") * metrics.widthPixels).toFloat()
+            args.has("fx") -> phoneCoordinate(args.getDouble("fx"), metrics.widthPixels, true)
             args.has("x") -> args.getDouble("x").toFloat()
             fallback != null -> bounds.exactCenterX()
             else -> { finish(JSONObject().put("ok", false).put("error", "Pass text, desc, x/y or fx/fy")); return }
         }
         val y = when {
-            args.has("fy") -> (args.getDouble("fy") * metrics.heightPixels).toFloat()
+            args.has("fy") -> phoneCoordinate(args.getDouble("fy"), metrics.heightPixels, true)
             args.has("y") -> args.getDouble("y").toFloat()
             fallback != null -> bounds.exactCenterY()
             else -> { finish(JSONObject().put("ok", false).put("error", "Pass text, desc, x/y or fx/fy")); return }
         }
+        rejectKeyboardTap(x, y)
         gesture(Path().apply { moveTo(x, y) }, 60, finish)
     }
 
     /** Types into whatever currently holds input focus, which is how a person types. */
     private fun type(root: AccessibilityNodeInfo, args: JSONObject): JSONObject {
         val value = args.getString("text")
-        val target = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: firstEditable(root)
-            ?: return JSONObject().put("ok", false).put("error", "No input field is focused; tap one first")
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        check(focused?.isPassword != true) { "Password fields are not supported" }
+        val target = focused?.takeIf { it.isEditable } ?: firstEditable(root)
+            ?: return typeThroughInputConnection(root.packageName?.toString().orEmpty(), value)
         check(!target.isPassword) { "Password fields are not supported" }
         check(target.isEditable) { "The focused control is not editable" }
         val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,
             Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) })
+        if (!ok) return typeThroughInputConnection(root.packageName?.toString().orEmpty(), value)
         revision.incrementAndGet()
-        return JSONObject().put("ok", ok).apply { if (!ok) put("error", "The app refused the text") }
+        return JSONObject().put("ok", ok).apply {
+            if (!ok) put("error", "The app refused the text")
+            else put("verificationRequired", true).put("hint", "Observe the field or take a screenshot to verify the text before sending; ACTION_SET_TEXT acceptance alone does not confirm its contents.")
+        }
+    }
+
+    /** Android 13+ exposes the active editor independently of the accessibility tree. */
+    private fun typeThroughInputConnection(pkg: String, value: String): JSONObject {
+        if (Build.VERSION.SDK_INT < 33) return JSONObject().put("ok", false)
+            .put("error", "No accessible editable field. Native input fallback requires Android 13 or newer.")
+        val method = inputMethod
+        val editor = method?.currentInputEditorInfo
+        val connection = method?.currentInputConnection
+        if (method?.currentInputStarted != true || editor == null || connection == null || editor.packageName != pkg) {
+            return JSONObject().put("ok", false).put("error", "No active input connection for the foreground app; tap its input field and observe again")
+        }
+        val kind = editor.inputType and android.text.InputType.TYPE_MASK_CLASS
+        val variation = editor.inputType and android.text.InputType.TYPE_MASK_VARIATION
+        check(!(kind == android.text.InputType.TYPE_CLASS_TEXT && variation in setOf(
+            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD,
+            android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
+            android.text.InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) &&
+            !(kind == android.text.InputType.TYPE_CLASS_NUMBER && variation == android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD)) {
+            "Password fields are not supported"
+        }
+        check(kind != android.text.InputType.TYPE_NULL) { "The editor does not accept text" }
+        // Match ACTION_SET_TEXT replacement semantics, rather than appending on retries.
+        connection.performContextMenuAction(android.R.id.selectAll)
+        connection.commitText(value, 1, null)
+        revision.incrementAndGet()
+        return JSONObject().put("ok", true).put("method", "inputConnection").put("verificationRequired", true)
+            .put("hint", "Input was dispatched, not verified. Observe or screenshot to confirm the actual field contents before sending. Do not blindly repeat input.")
     }
 
     private fun scroll(args: JSONObject, finish: (JSONObject) -> Unit) {
@@ -368,16 +450,40 @@ class PocketAccessibilityService : AccessibilityService() {
 
     private fun capture(credential: String, finish: (JSONObject) -> Unit) {
         if (Build.VERSION.SDK_INT < 30) { finish(JSONObject().put("ok", false).put("error", "Screenshots require Android 11")); return }
-        captureFrame(credential, revision.get(), finish)
+        // The work notice is a window of this app, and a capture that sees two apps is
+        // refused. Take it down, let the window actually go, capture, then put it back.
+        val notice = pill != null
+        hidePill()
+        main.postDelayed({
+            captureFrame(credential, revision.get()) { result ->
+                if (notice && result.optBoolean("ok")) showPill(tr("DSH 正在工作"))
+                finish(result)
+            }
+        }, 150)
     }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
     private fun captureFrame(credential: String, at: Long, finish: (JSONObject) -> Unit) {
         val windows = windows.toList()
         val pkg = rootInActiveWindow?.packageName?.toString().orEmpty()
+        if (pkg !in PhoneControl.allowed) {
+            finish(JSONObject().put("ok", false).put("error", "Foreground app is not allowed: $pkg"))
+            return
+        }
         // A full-display capture must not include a second app sitting in split screen.
-        if (windows.any { window -> window.root?.packageName?.toString()?.let { it != pkg && it != "com.android.systemui" } == true }) {
-            finish(JSONObject().put("ok", false).put("error", "Use a single app window for screenshots"))
+        // Keyboards, taskbars and ROM system panels are not split-screen apps.
+        // Classify by window type rather than assuming all system UI uses one package.
+        val otherWindows = windows.filter { window ->
+            window.type != AccessibilityWindowInfo.TYPE_SYSTEM &&
+                window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD &&
+                window.root?.packageName?.toString()?.let { it != pkg && it != packageName } == true
+        }
+        if (otherWindows.isNotEmpty()) {
+            finish(JSONObject().put("ok", false).put("error", "Use a single app window for screenshots")
+                .put("blockingWindows", JSONArray().apply {
+                    otherWindows.forEach { put(JSONObject().put("package", it.root?.packageName?.toString())
+                        .put("type", it.type)) }
+                }))
             return
         }
         takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
@@ -386,12 +492,14 @@ class PocketAccessibilityService : AccessibilityService() {
                     check(PhoneControl.authorized(credential) && at == revision.get()) { "The screen changed while capturing; retry" }
                     val source = Bitmap.wrapHardwareBuffer(value.hardwareBuffer, value.colorSpace) ?: error("Empty screenshot")
                     val bitmap = source.copy(Bitmap.Config.ARGB_8888, false); source.recycle()
+                    val width = bitmap.width
+                    val height = bitmap.height
                     val ratio = minOf(1f, 1440f / maxOf(bitmap.width, bitmap.height))
                     val small = Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
                     val output = ByteArrayOutputStream(); small.compress(Bitmap.CompressFormat.JPEG, 85, output)
                     if (small !== bitmap) small.recycle()
                     bitmap.recycle()
-                    finish(JSONObject().put("ok", true).put("width", bitmap.width).put("height", bitmap.height)
+                    finish(JSONObject().put("ok", true).put("width", width).put("height", height).put("input", inputStatus(pkg))
                         .put("imageBase64", android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)))
                 } catch (e: Exception) { finish(JSONObject().put("ok", false).put("error", e.message)) }
                 finally { value.hardwareBuffer.close() }

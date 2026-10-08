@@ -100,7 +100,6 @@ fun ApiPresetsPane(state: PocketState, model: PocketModel) {
             Text(tr("默认使用模型自身设置；可选深度取决于 API 的支持。"), style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { advanced = !advanced }) { Text(tr("高级选项") + if (advanced) " ▴" else " ▾") }
             if (advanced) {
-                Row { Checkbox(draft.vision, onCheckedChange = { draft = draft.copy(vision = it) }); Text("模型支持图片（手机截图）", Modifier.padding(top = 12.dp)) }
                 OutlinedTextField(name, { name = it }, label = { Text(tr("显示名称（可选）")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Box {
                     OutlinedButton(onClick = { protocolMenu = true }) { Text(tr("协议") + " · " + protocols[draft.protocol]) }
