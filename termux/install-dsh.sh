@@ -15,6 +15,20 @@ echo '[1/6] Checking the Termux build environment'
 pkg install -y python clang make cmake pkg-config git ripgrep ndk-sysroot libandroid-spawn
 if ! command -v node >/dev/null; then pkg install -y nodejs-lts; fi
 if ! command -v npm >/dev/null; then pkg install -y npm; fi
+# Installing is not upgrading: a Termux set up earlier can hold a cmake whose binary
+# needs a libc++ that is upgradable but not upgraded, and the native build then dies
+# with "cannot locate symbol ... referenced by cmake", which names neither cause nor
+# cure. Ask the toolchain to run, and bring the packages forward once if it cannot.
+if ! cmake --version >/dev/null 2>&1; then
+  echo '[*] The build tools cannot run as installed (stale libraries); upgrading Termux packages'
+  # Keep the configuration already on the device: a custom mirror makes dpkg stop and
+  # ask about sources.list, which in a script is an error rather than a question.
+  pkg upgrade -y -o Dpkg::Options::=--force-confold || true
+fi
+if ! cmake --version >/dev/null 2>&1; then
+  echo 'The build tools still cannot run after an upgrade; cmake --version keeps failing.'
+  exit 1
+fi
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (!(major >= 24 || (major === 22 && minor >= 19))) throw Error("Node 22.19+ or 24+ is required")'
 
 echo '[2/6] Downloading pinned DSH 0.2.0-rc.2 into its own installation'

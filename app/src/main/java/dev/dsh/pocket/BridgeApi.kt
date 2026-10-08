@@ -16,7 +16,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.6.3"
+const val BRIDGE_VERSION = "0.6.5"
 
 /**
  * Never route through a proxy. The bridge only listens on this device's own
@@ -67,6 +67,21 @@ class BridgeApi @JvmOverloads constructor(internal val token: String, internal v
         .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
 
     internal fun decode(response: Response): JSONObject = decodeText(response.body?.string().orEmpty(), response.code)
+
+    /** A health check must not inherit file browsing's 60 second timeout. */
+    suspend fun health(): JSONObject = kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+        val request = Request.Builder().url("http://$host:$port/v1/health")
+            .header("Authorization", "Bearer $token").header("Accept-Language", language()).build()
+        val call = client.newCall(request)
+        call.timeout().timeout(1500, TimeUnit.MILLISECONDS)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { continuation.resumeWith(Result.failure(e)) }
+            override fun onResponse(call: Call, response: Response) {
+                continuation.resumeWith(runCatching { response.use { decode(it) } })
+            }
+        })
+    }
 
     /**
      * A raw, unfiltered report of what this process actually sees.
