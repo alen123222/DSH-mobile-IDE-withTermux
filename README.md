@@ -3,7 +3,7 @@
 **在 Android 上使用完整 Termux 环境的原生 AI 编程助手以及手机操作功能。**
 
 DSH Pocket 把 Kotlin / Jetpack Compose 界面、运行在手机本地的服务，以及适配 Android arm64 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 连成一体：可以在聊天里让模型改文件、跑命令，也可以直接开终端自己敲。
-
+本项目是 Android 应用（Termux 上的 DSH 宿主），不是可安装进 DSH profile 的插件包；其中的 DSH 补丁仅用于 Android/Termux 适配。
 当前版本：**0.6.2-dev（开发预览）**。工作区文件保留在原来的位置，不导入 App 私有目录。本项目与 DeepSeek 官方 Android App、Termux 官方项目均无隶属关系。
 
 ## 目录
