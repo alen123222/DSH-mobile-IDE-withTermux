@@ -59,6 +59,7 @@ private val Surface = Color(0xFFF7F8FC)
 class MainActivity : ComponentActivity() {
     private val model: PocketModel by viewModels()
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        TermuxConnection.allowed.value = granted
         if (!granted) model.error(tr("请在系统设置 → DSH Pocket → 权限中允许在 Termux 运行命令"))
     }
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -492,9 +493,12 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
     val needsUpdate = state.health?.string("version") != BRIDGE_VERSION
     var onboarding by remember { mutableStateOf(false) }
     var permission by remember { mutableStateOf(false) }
-    // Termux owns its prompt: no app can type into it, so the one switch it needs is
-    // the only manual step, and this is that instruction.
-    val permissionCommand = "mkdir -p ~/.termux && echo \"allow-external-apps = true\" >> ~/.termux/termux.properties"
+    // Termux owns its prompt, so its switch cannot be typed for the user; this command
+    // is the whole of that instruction. It ends with a reload because the property is
+    // only read when Termux loads its settings.
+    val permissionCommand = TermuxConnection.setupCommand
+    val permitted by TermuxConnection.allowed.collectAsStateWithLifecycle()
+    LaunchedEffect(Unit) { TermuxConnection.refreshPermission(context) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Text(tr("本地环境"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Text(tr("DSH 和命令运行在手机上的完整 Termux 中。"), color = Color(0xFF64748B))
@@ -502,17 +506,26 @@ private fun EnvironmentPane(state: PocketState, model: PocketModel, grant: () ->
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (state.connected) tr("● Termux 已连接") else tr("○ 完成首次连接"), fontWeight = FontWeight.SemiBold, color = if (state.connected) Color(0xFF16835F) else Blue)
                 if (!state.connected) {
-                    Text(tr("首次连接会安装 Node/Python、写入配置并启动本地服务。Termux 有一个一次性开关需要你允许本应用运行命令。"),
-                        style = MaterialTheme.typography.bodyMedium)
+                    // Two permissions gate this, and they are different things: Android
+                    // must allow this app to run commands in Termux, and Termux must have
+                    // its own switch on. Showing only one of them is how a first run
+                    // ended up with nothing left to press.
+                    Text(tr("首次连接会安装 Node/Python、写入配置并启动本地服务。"), style = MaterialTheme.typography.bodyMedium)
+                    if (permitted) {
+                        Text(tr("✓ 已允许本应用在 Termux 中运行命令"), style = MaterialTheme.typography.bodySmall, color = Color(0xFF16835F))
+                    } else {
+                        Button(onClick = grant) { Text(tr("① 授予 Termux 权限")) }
+                        Text(tr("系统会弹出授权框；它和 Termux 内部的开关是两件事，两个都要。"), style = MaterialTheme.typography.bodySmall)
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // This one acts. Termux refusing the command is the one failure a
+                        // This one acts. Termux refusing the command is the failure a
                         // first-time user hits, so it opens the instructions with the reason.
-                        Button(onClick = {
+                        Button(enabled = permitted, onClick = {
                             runCatching { TermuxConnection.firstRun(context, model.token) }
                                 .onSuccess { safe { TermuxConnection.openApp(context) } }
                                 .onFailure { onboarding = true; permission = true }
-                        }) { Text(tr("一键完成首次连接")) }
-                        OutlinedButton(onClick = { onboarding = true; permission = true }) { Text(tr("需要什么权限？")) }
+                        }) { Text(tr("② 一键完成首次连接")) }
+                        OutlinedButton(onClick = { onboarding = true; permission = true }) { Text(tr("Termux 里的开关")) }
                     }
                 }
                 Button(onClick = {

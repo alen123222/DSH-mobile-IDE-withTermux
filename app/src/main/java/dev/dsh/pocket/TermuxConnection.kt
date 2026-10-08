@@ -23,6 +23,14 @@ object TermuxConnection {
     fun installed(context: Context): Boolean = try { context.packageManager.getPackageInfo("com.termux", 0); true } catch (_: PackageManager.NameNotFoundException) { false }
     fun permitted(context: Context) = context.checkSelfPermission(PERMISSION) == PackageManager.PERMISSION_GRANTED
 
+    /**
+     * The Android permission above, mirrored for the UI. It is separate from Termux's
+     * own "allow external apps" switch, and both are needed; without it every command
+     * is refused before Termux ever sees it.
+     */
+    val allowed = MutableStateFlow(false)
+    fun refreshPermission(context: Context) { allowed.value = permitted(context) }
+
     private fun run(context: Context, script: String, background: Boolean, title: String) {
         check(installed(context)) { tr("请先安装并打开 Termux") }
         check(permitted(context)) { tr("请先授予“在 Termux 环境中运行命令”权限") }
