@@ -93,6 +93,53 @@ test('the parent of a top-level folder is itself and never blank', async t => {
   assert.equal(result.path, top);
 });
 
+test('a stalled storage probe times out and a late directory handle is closed', async () => {
+  const original = fs.promises.opendir;
+  let release;
+  let closed = false;
+  fs.promises.opendir = async function(target, ...args) {
+    if (target === '/storage/emulated/0') {
+      await new Promise(resolve => { release = resolve; });
+      return { close: async () => { closed = true; } };
+    }
+    return original.call(this, target, ...args);
+  };
+  try {
+    const ws = new Workspaces(root, { storageProbeTimeoutMs: 30 });
+    const items = await ws.shortcuts();
+    assert.equal(items.find(i => i.path === os.homedir()).available, true);
+    const slow = items.find(i => i.path === '/storage/emulated/0');
+    assert.equal(slow.available, false);
+    assert.match(slow.reason, /超时/);
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(closed, true);
+  } finally { release?.(); fs.promises.opendir = original; }
+});
+
+test('stalled volume discovery still returns the home and internal shortcuts', async () => {
+  const original = fs.promises.readdir;
+  fs.promises.readdir = async function(target, ...args) {
+    if (target === '/storage') return new Promise(() => {});
+    return original.call(this, target, ...args);
+  };
+  try {
+    const items = await new Workspaces(root, { storageProbeTimeoutMs: 30 }).shortcuts();
+    assert.equal(items.find(i => i.path === os.homedir()).available, true);
+    assert.ok(items.some(i => i.path === '/storage/emulated/0'));
+  } finally { fs.promises.readdir = original; }
+});
+
+test('browsing and validation do not resolve paths synchronously', async () => {
+  const original = fs.realpathSync;
+  fs.realpathSync = () => { throw new Error('must not block the event loop'); };
+  try {
+    const ws = new Workspaces(root);
+    assert.ok((await ws.browse(root, true)).entries);
+    assert.equal((await ws.validate(root)).writable, true);
+  } finally { fs.realpathSync = original; }
+});
+
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 test('an external volume is offered and a Termux link still browses and resolves', async () => {

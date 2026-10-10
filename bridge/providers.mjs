@@ -104,7 +104,11 @@ export function modelRoots(baseUrl) {
   if (!raw) return [];
   let url;
   try { url = new URL(raw); } catch { return []; }
-  const path = url.pathname.replace(/\/(chat\/completions|completions|responses|messages)$/, '');
+  // The Messages gateway lives under /anthropic, but its model catalog is the ordinary
+  // one at the origin: /anthropic/models and /anthropic/v1/models both answer 404.
+  const path = url.pathname
+    .replace(/\/(chat\/completions|completions|responses|messages)$/, '')
+    .replace(/\/anthropic$/, '');
   const roots = new Set([path]);
   if (!/\/v\d+$/.test(path)) roots.add(path.replace(/\/$/, '') + '/v1');
   return [...roots].map(prefix => url.origin + (prefix.endsWith('/') ? prefix.slice(0, -1) : prefix) + '/models');
@@ -130,12 +134,18 @@ export async function listModels(settings) {
   const roots = modelRoots(settings.baseUrl);
   if (roots.length === 0) throw new ApiError(400, t('请先填写 API 地址'));
   let last = '';
+  // One budget for the whole search instead of one per candidate: an endpoint that
+  // cannot be reached used to spend the full timeout on every root in turn, and the
+  // person watching the button had no idea how long that would be.
+  const deadline = Date.now() + 12000;
   for (const url of roots) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 500) { last = last || t('超时'); break; }
     let response;
     try {
       response = await fetch(url, { headers: { Accept: 'application/json',
         ...(settings.apiKey ? { Authorization: 'Bearer ' + settings.apiKey } : {}) },
-        signal: AbortSignal.timeout(20000) });
+        signal: AbortSignal.timeout(remaining) });
     } catch (error) {
       last = t('无法连接') + ' ' + url + '：' + (error?.message || error);
       continue;

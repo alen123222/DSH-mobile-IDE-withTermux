@@ -37,6 +37,22 @@ export function directory(value) {
   catch { /* Let the actual read decide. */ }
   return result;
 }
+// A stalled removable mount must not block the bridge's event loop.
+export async function directoryAsync(value) {
+  text(value, t('目录'));
+  if (!path.isAbsolute(value)) throw new ApiError(400, t('请选择绝对路径'));
+  try {
+    const result = await fs.promises.realpath(value);
+    if (!(await fs.promises.stat(result)).isDirectory()) throw new ApiError(400, t('该路径不是文件夹'));
+    return result;
+  } catch (error) {
+    if (error.code === 'ENOENT') throw new ApiError(404, t('目录不存在'));
+    if (error.code === 'EACCES' || error.code === 'EPERM') throw new ApiError(403,
+      t('没有读取该目录的权限。共享存储需要先在 Termux 执行一次 termux-setup-storage。'));
+    throw error;
+  }
+}
+
 export function writeJson(filename, value) {
   fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   const temporary = `${filename}.${crypto.randomUUID()}.tmp`;

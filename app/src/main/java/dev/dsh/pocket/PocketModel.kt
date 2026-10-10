@@ -35,6 +35,8 @@ data class PocketState(
     val engineLog: String = "", val engineStage: String = "", val engineSeconds: Int = 0, val engineRunning: Boolean = false,
     /** How much the installer has downloaded, for the silent stretch npm produces. */
     val engineSize: String = "",
+    /** Seconds spent waiting for an endpoint's model list, with a way out. */
+    val probeSeconds: Int = 0,
     /** "global" or "china": the package source the first install should use. */
     val mirror: String = "global",
     val connectionStage: String = "", val connectionSeconds: Int = 0, val connectionFailure: String? = null,
@@ -42,6 +44,7 @@ data class PocketState(
     val workspaces: List<Workspace> = emptyList(), val selected: Workspace? = null,
     val browserPath: String = "", val browserParent: String = "", val entries: List<FileEntry> = emptyList(),
     val browserLoading: Boolean = false, val browserTruncated: Boolean = false,
+    val browserError: String? = null, val shortcutsError: String? = null, val shortcutsLoading: Boolean = false,
     val shortcuts: List<Shortcut> = emptyList(), val chats: List<JSONObject> = emptyList(), val chat: JSONObject? = null,
     val settings: EngineSettings = EngineSettings(), val error: String? = null, val viewer: OpenFile? = null,
     val terminalId: String? = null, val pendingAttachments: List<Attachment> = emptyList(),
@@ -65,23 +68,47 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     private var selectionRevision = 0
     private var browserRevision = 0
     private var browseCall: Job? = null
+    private var shortcutsCall: Job? = null
+    private var browsingDirectoriesOnly = false
 
     init { PhoneControl.load(application); connect(false) }
     /**
      * Ask the configured endpoint which models it serves, so presets can be
      * added from the real list instead of typed by hand.
      */
-    fun probeModels(settings: EngineSettings) = task {
-        mutable.update { it.copy(probing = true, discovered = emptyList()) }
-        try {
-            val body = withContext(Dispatchers.IO) { api.call("providers/models", "POST", settings.json()) }
-            val items = body.objects("items").map { it.string("id") }.filter { it.isNotBlank() }.distinct()
-            mutable.update { it.copy(probing = false, discovered = items) }
-            if (items.isEmpty()) error(tr("这个地址没有返回模型列表"))
-        } catch (e: Exception) {
-            mutable.update { it.copy(probing = false, discovered = emptyList()) }
-            error(e.message ?: tr("无法获取模型列表"))
+    private var probing: Job? = null
+
+    fun probeModels(settings: EngineSettings) {
+        if (probing?.isActive == true) return
+        mutable.update { it.copy(probing = true, discovered = emptyList(), probeSeconds = 0) }
+        probing = viewModelScope.launch {
+            // A countdown, because a failing endpoint is only obvious as a wait.
+            val ticker = launch {
+                while (true) {
+                    mutable.update { it.copy(probeSeconds = it.probeSeconds + 1) }
+                    delay(1000)
+                }
+            }
+            try {
+                val body = withContext(Dispatchers.IO) { api.call("providers/models", "POST", settings.json()) }
+                val items = body.objects("items").map { it.string("id") }.filter { it.isNotBlank() }.distinct()
+                mutable.update { it.copy(probing = false, discovered = items) }
+                if (items.isEmpty()) error(tr("这个地址没有返回模型列表"))
+            } catch (e: CancellationException) {
+                mutable.update { it.copy(probing = false) }
+                throw e
+            } catch (e: Exception) {
+                mutable.update { it.copy(probing = false, discovered = emptyList()) }
+                error(e.message ?: tr("无法获取模型列表"))
+            } finally { ticker.cancel() }
         }
+    }
+
+    /** Gives up on the endpoint without waiting for its timeout. */
+    fun cancelProbe() {
+        probing?.cancel()
+        probing = null
+        mutable.update { it.copy(probing = false) }
     }
     fun clearDiscovered() = mutable.update { it.copy(discovered = emptyList()) }
     fun removeAttachment(name: String) = mutable.update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { file -> file.name == name }) }
@@ -152,7 +179,9 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
             ProviderEndpoint.base(settings)
             require(name.isNotBlank() && settings.model.isNotBlank()) { tr("请填写预设名称和模型 ID") }
             val label = group ?: state.value.presets.firstOrNull { it.id == id }?.group.orEmpty()
-            val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(), settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(), model = settings.model.trim(), provider = settings.route), label.trim())
+            val preset = ApiPreset(id ?: UUID.randomUUID().toString(), name.trim(),
+                settings.copy(apiKey = settings.apiKey.trim(), baseUrl = settings.baseUrl.trim(),
+                    model = settings.model.trim(), provider = settings.route), label.trim())
             val items = if (state.value.presets.any { it.id == preset.id })
                 state.value.presets.map { if (it.id == preset.id) preset else it } else state.value.presets + preset
             secrets.savePresets(preset.id, items)
@@ -177,10 +206,13 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
         try {
             require(baseUrl.isNotBlank()) { tr("需要填写 API 地址") }
             val wanted = ids.toSet()
+            // The address decides the protocol where it can: editing api.deepseek.com to
+            // or from its /anthropic path is how the user switches between the two APIs.
+            val next = if (baseUrl.contains("api.deepseek.com")) inferProtocol(baseUrl) else protocol
             val items = state.value.presets.map { preset ->
                 if (preset.id !in wanted) preset else ApiPreset(preset.id, preset.name,
-                    preset.settings.copy(baseUrl = baseUrl.trim(), apiKey = apiKey.trim(), protocol = protocol,
-                        provider = if (protocol == "deepseek-messages") "deepseek-official" else "pocket-openai"), label.trim())
+                    preset.settings.copy(baseUrl = baseUrl.trim(), apiKey = apiKey.trim(), protocol = next,
+                        provider = if (next == "deepseek-messages") "deepseek-official" else "pocket-openai"), label.trim())
             }
             val active = state.value.activePresetId
             secrets.savePresets(active, items)
@@ -360,16 +392,15 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
     // Cancel the in-flight call, keep one request at a time, and always clear
     // the loading state.
     fun browse(path: String = "", dirsOnly: Boolean = false) {
+        browsingDirectoriesOnly = dirsOnly
         if (browseCall?.isActive == true) browseCall?.cancel()
         val revision = ++browserRevision
-        mutable.update { it.copy(browserLoading = true) }
+        mutable.update { it.copy(browserLoading = true, browserError = null, entries = emptyList(), browserTruncated = false) }
         browseCall = viewModelScope.launch {
             var loaded: JSONObject? = null
             var failure: String? = null
             try {
-                loaded = withContext(Dispatchers.IO) {
-                    api.call("browse", query = mapOf("path" to path, "dirs" to dirsOnly.toString()))
-                }
+                loaded = api.storageCall("browse", query = mapOf("path" to path, "dirs" to dirsOnly.toString()))
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -380,8 +411,7 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
                 browserPath = loaded!!.getString("path"), browserParent = loaded!!.getString("parent"),
                 entries = loaded!!.objects("entries").map(FileEntry::from), browserTruncated = loaded!!.optBoolean("truncated")) }
             else mutable.update { it.copy(entries = emptyList(), browserTruncated = false) }
-            failure?.let { error(it) }
-            mutable.update { it.copy(browserLoading = false) }
+            mutable.update { it.copy(browserLoading = false, browserError = failure) }
         }
     }
     /** Go up one level. Kept separate so the parent path is never blank. */
@@ -400,26 +430,44 @@ class PocketModel(application: Application) : AndroidViewModel(application) {
      * unavailable with an empty path, so a failed request rendered 主目录 as
      * permanently disabled, which is why home appeared to have no permission.
      */
-    fun loadShortcuts() = viewModelScope.launch {
-        val items = runCatching {
-            withContext(Dispatchers.IO) {
-                val storage = getApplication<Application>().getSystemService(StorageManager::class.java)
-                val volumes = storage.storageVolumes.filter { it.isRemovable }.mapNotNull {
-                    if (Build.VERSION.SDK_INT >= 30) it.directory?.absolutePath
-                    else it.uuid?.let { uuid -> "/storage/$uuid" }
+    fun loadShortcuts() {
+        shortcutsCall?.cancel()
+        mutable.update { it.copy(shortcutsLoading = true, shortcutsError = null,
+            shortcuts = listOf(Shortcut(tr("主目录"), it.health?.string("home").orEmpty(), true),
+                Shortcut(tr("内部存储"), "/storage/emulated/0", true))) }
+        shortcutsCall = viewModelScope.launch {
+            try {
+                val volumes = withContext(Dispatchers.IO) {
+                    val storage = getApplication<Application>().getSystemService(StorageManager::class.java)
+                    storage.storageVolumes.filter { it.isRemovable }.mapNotNull {
+                        if (Build.VERSION.SDK_INT >= 30) it.directory?.absolutePath
+                        else it.uuid?.let { uuid -> "/storage/$uuid" }
+                    }
                 }
-                api.call("shortcuts", query = mapOf("external" to volumes.joinToString("\n"))).objects("items").map {
+                // Keep discovered drives visible even if the bridge cannot answer.
+                mutable.update { it.copy(shortcuts = it.shortcuts + volumes.distinct().map { path ->
+                    Shortcut(tr("外接存储") + " · " + path.substringAfterLast('/'), path, true)
+                }) }
+                val items = api.storageCall("shortcuts", query = mapOf("external" to volumes.joinToString("\n")), timeoutMs = 5_000).objects("items").map {
                     Shortcut(it.getString("label"), it.getString("path"), it.optBoolean("available"), it.string("reason"))
                 }
+                mutable.update { it.copy(shortcuts = items, shortcutsLoading = false) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                mutable.update { it.copy(shortcutsError = describe(e), shortcutsLoading = false) }
             }
-        }.getOrElse {
-            // Unknown, not forbidden: keep them tappable so tapping still tries,
-            // and the browse call reports the real error if there is one. An
-            // empty path means "the server default", which is the same thing as
-            // home for this bridge, so it is not an empty target after all.
-            listOf(Shortcut(tr("主目录"), "", true), Shortcut(tr("内部存储"), "/storage/emulated/0", true))
         }
-        mutable.update { it.copy(shortcuts = items) }
+    }
+
+    fun closeWorkspacePicker() {
+        if (browsingDirectoriesOnly) {
+            ++browserRevision
+            browseCall?.cancel()
+            mutable.update { it.copy(browserLoading = false) }
+        }
+        shortcutsCall?.cancel()
+        mutable.update { it.copy(shortcutsLoading = false) }
     }
 
     fun addWorkspace(path: String, onSuccess: () -> Unit = {}) = task {

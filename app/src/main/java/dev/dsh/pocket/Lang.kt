@@ -17,6 +17,9 @@ object Lang {
     val chinese: Boolean get() = Locale.getDefault().language.startsWith("zh")
 
     private val english: Map<String, String> = mapOf(
+        "正在检查存储权限…" to "Checking storage access…",
+        "存储读取超时，请检查 Termux 存储权限或外接盘连接后重试。" to "Storage did not respond in time. Check Termux storage permissions or the removable drive connection and retry.",
+        "外接存储" to "External storage",
         "Termux 在后台打开终端窗口时需要「显示在其他应用上层」权限。" to "Termux needs Display over other apps to open terminal windows from the background.",
         "正在安装运行环境并启动服务，首次下载可能需要几分钟…" to "Installing the runtime and starting the service. The first download can take several minutes…",
         "首次安装等待已达 10 分钟，尚未连接。请查看下方安装日志；重试会继续等待已有安装，不会重复启动。" to "No connection after 10 minutes. Check the installation log below. Retrying waits for an existing installation without starting another one.",
@@ -254,6 +257,7 @@ object Lang {
         "已执行，检查" to "Done, check again",
         "看说明" to "How?",
         "已下载 " to "Downloaded ",
+        "超时" to "timed out",
         "包源" to "Package source",
         "全球" to "Worldwide",
         "中国大陆" to "Mainland China",

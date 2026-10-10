@@ -63,6 +63,7 @@ const english = {
   '没有读取该目录的权限。共享存储需要先在 Termux 执行一次 termux-setup-storage。':
     'No permission to read that folder. Shared storage needs termux-setup-storage in Termux first.',
   '目录链接形成循环': 'The folder link forms a loop',
+  '存储响应超时，请检查 Termux 存储权限或重新连接外接盘后刷新。': 'Storage timed out. Check Termux storage permissions or reconnect the removable drive and refresh.',
   '主目录': 'Home',
   '内部存储': 'Internal storage',
   '目录名': 'folder name',

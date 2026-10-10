@@ -16,7 +16,7 @@ import java.net.SocketAddress
 import java.net.URI
 import java.util.concurrent.TimeUnit
 
-const val BRIDGE_VERSION = "0.6.5"
+const val BRIDGE_VERSION = "0.6.7"
 
 /**
  * Never route through a proxy. The bridge only listens on this device's own
@@ -65,6 +65,7 @@ class BridgeApi @JvmOverloads constructor(internal val token: String, internal v
     internal var streamClient = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS).retryOnConnectionFailure(true)
         .proxy(Proxy.NO_PROXY).proxySelector(NO_PROXY).build()
+    internal var storageClient = client
 
     internal fun decode(response: Response): JSONObject = decodeText(response.body?.string().orEmpty(), response.code)
 
@@ -163,6 +164,28 @@ class BridgeApi @JvmOverloads constructor(internal val token: String, internal v
             val input = response.body?.byteStream() ?: throw IllegalStateException(tr("响应内容为空"))
             input.use { source -> target.outputStream().use { sink -> source.copyTo(sink) } }
         }
+    }
+
+    /** Picker calls release their socket immediately when navigation cancels them. */
+    suspend fun storageCall(route: String, query: Map<String, String> = emptyMap(),
+                            timeoutMs: Long = 10_000): JSONObject = kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+        val url = "http://$host:$port/v1/$route".toHttpUrl().newBuilder()
+        query.forEach { (key, value) -> url.addQueryParameter(key, value) }
+        val request = Request.Builder().url(url.build()).header("Authorization", "Bearer $token")
+            .header("Accept-Language", language()).build()
+        val call = storageClient.newCall(request)
+        call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                val failure = if (e is java.io.InterruptedIOException)
+                    IOException(tr("存储读取超时，请检查 Termux 存储权限或外接盘连接后重试。"), e) else e
+                continuation.resumeWith(Result.failure(failure))
+            }
+            override fun onResponse(call: Call, response: Response) {
+                continuation.resumeWith(runCatching { response.use { decode(it) } })
+            }
+        })
     }
 
     fun call(route: String, method: String = "GET", body: JSONObject? = null,
@@ -276,8 +299,8 @@ data class Workspace(val id: String, val name: String, val path: String, val ava
 data class FileEntry(val name: String, val path: String, val directory: Boolean, val size: Long) {
     companion object { fun from(json: JSONObject) = FileEntry(json.getString("name"), json.getString("path"), json.getBoolean("directory"), json.optLong("size")) }
 }
-data class EngineSettings(val model: String = "deepseek-v4-flash", val provider: String = "deepseek-official", val apiKey: String = "", val baseUrl: String = "",
-    val protocol: String = "deepseek-messages", val autoVersion: Boolean = true,
+data class EngineSettings(val model: String = "deepseek-flash", val provider: String = "deepseek-official", val apiKey: String = "", val baseUrl: String = "",
+    val protocol: String = "openai-chat", val autoVersion: Boolean = true,
     val contextWindow: Int = 131072, val maxTokens: Int = 8192, val reasoningEffort: String = "", val vision: Boolean = false) {
     // Kotlin default arguments do not generate Java overloads, so the Java
     // instrumentation test could no longer construct this after contextWindow
@@ -318,6 +341,13 @@ fun providerGroups(presets: List<ApiPreset>): List<Pair<String, List<ApiPreset>>
     presets.groupBy { it.settings.protocol + "|" + it.settings.baseUrl.trim().trimEnd('/') + "|" + it.settings.apiKey }
         .map { (_, items) -> providerLabel(items.first()) to items }
 
-/** The official DeepSeek endpoint speaks its own protocol; everything else is OpenAI. */
-fun inferProtocol(baseUrl: String): String =
-    if (baseUrl.contains("api.deepseek.com")) "deepseek-messages" else "openai-chat"
+/**
+ * Which protocol an address speaks. The official endpoint serves both, under two
+ * different paths, so the path decides: /anthropic is the Messages gateway, the plain
+ * address is the OpenAI-compatible one. Rewriting the address instead would make the
+ * user's own edits appear to be ignored, which is worse than asking them to be exact.
+ */
+fun inferProtocol(baseUrl: String): String {
+    val trimmed = baseUrl.trim().trimEnd('/')
+    return if (trimmed.contains("api.deepseek.com") && trimmed.endsWith("/anthropic")) "deepseek-messages" else "openai-chat"
+}

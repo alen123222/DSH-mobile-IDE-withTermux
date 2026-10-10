@@ -119,8 +119,10 @@ fun ApiPresetsPane(state: PocketState, model: PocketModel) {
                     }) { Text(tr("添加")) }
                     OutlinedButton(enabled = !state.probing && items.first().settings.baseUrl.isNotBlank(),
                         onClick = { model.probeModels(items.first().settings.copy(model = "")) }) {
-                        Text(if (state.probing) tr("正在获取…") else tr("从端点获取"))
+                        Text(if (state.probing) tr("正在获取…") + " " + state.probeSeconds + tr(" 秒") else tr("从端点获取"))
                     }
+                    // An endpoint that never answers should not hold the button hostage.
+                    if (state.probing) TextButton(onClick = { model.cancelProbe() }) { Text(tr("取消")) }
                     TextButton(onClick = { adding = null; model.clearDiscovered() }) { Text(tr("取消")) }
                 }
                 // One tap adds; what is already here is not offered again.

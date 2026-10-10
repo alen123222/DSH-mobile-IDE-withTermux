@@ -93,7 +93,7 @@ export function createBridge({ stateDir, token, dshOptions = {} }) {
       const body = method === 'POST' ? await bodyOf(req) : {};
       let result;
       if (method === 'POST' && parts[1] === 'providers' && parts[2] === 'models') result = await listModels(connectionSettings(body));
-      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.6.5', platform: process.platform, arch: process.arch,
+      else if (method === 'GET' && parts[1] === 'health') result = { version: '0.6.7', platform: process.platform, arch: process.arch,
         home: os.homedir(), prefix: process.env.PREFIX || '', node: process.version, python: !!(executable('python3') || executable('python')),
         dsh: chats.dshBin(), dshProfile: 'sdk-minimal', pid: process.pid };
       else if (method === 'POST' && parts[1] === 'attach') result = attachFile(body);

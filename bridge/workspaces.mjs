@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { ApiError, directory, readJson, writeJson, text, within } from './util.mjs';
+import { ApiError, directory, directoryAsync, readJson, writeJson, text, within } from './util.mjs';
 import { t } from './i18n.mjs';
 
 async function mapLimited(items, transform, concurrency = 8) {
@@ -13,6 +13,16 @@ async function mapLimited(items, transform, concurrency = 8) {
     while (next < items.length) { const index = next++; result[index] = await transform(items[index]); }
   }));
   return result;
+}
+
+async function storageDeadline(operation, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([operation, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new ApiError(504,
+        t('存储响应超时，请检查 Termux 存储权限或重新连接外接盘后刷新。'))), milliseconds);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 function storageError(error) {
@@ -170,7 +180,7 @@ export class Workspaces {
   async validate(location) {
     let probe, owned = false;
     try {
-      const canonical = directory(this.location(location));
+      const canonical = await directoryAsync(this.location(location));
       const dir = await fs.promises.opendir(canonical);
       await dir.close();
       probe = path.join(canonical, `.dsh-pocket-check-${crypto.randomUUID()}`);
@@ -208,7 +218,7 @@ export class Workspaces {
     return { ...item, available: fs.existsSync(item.path) };
   }
   async browse(location = os.homedir(), dirsOnly = false) {
-    const canonical = directory(this.location(location));
+    const canonical = await directoryAsync(this.location(location));
     let dirents;
     try { dirents = await fs.promises.readdir(canonical, { withFileTypes: true }); }
     catch (error) {
@@ -256,7 +266,8 @@ export class Workspaces {
       { label: t('主目录'), path: home },
       { label: t('内部存储'), path: '/storage/emulated/0' },
     ];
-    const volumes = await fs.promises.readdir(storageRoot, { withFileTypes: true }).catch(() => []);
+    const budget = this.options.storageProbeTimeoutMs ?? 1500;
+    const volumes = await storageDeadline(fs.promises.readdir(storageRoot, { withFileTypes: true }), budget).catch(() => []);
     for (const volume of volumes) {
       if (['emulated', 'self'].includes(volume.name) || (!volume.isDirectory() && !volume.isSymbolicLink())) continue;
       candidates.push({ label: `外接存储 · ${volume.name}`, path: path.join(storageRoot, volume.name) });
@@ -272,13 +283,20 @@ export class Workspaces {
     // Reading a directory is the real test. A bare statSync on shared storage can
     // fail where the directory itself opens fine, and reporting that as "no
     // permission" would be wrong, so try to list it instead.
-    return await mapLimited(unique, async item => {
+    return await Promise.all(unique.map(async item => {
       let available = false;
       let reason = '';
-      try { const dir = await fs.promises.opendir(item.path); await dir.close(); available = true; }
+      try {
+        // Close even when a delayed open finishes after the deadline.
+        await storageDeadline((async () => {
+          const dir = await fs.promises.opendir(item.path);
+          await dir.close();
+        })(), budget);
+        available = true;
+      }
       catch (error) { reason = storageError(error).message; }
       return { ...item, available, reason };
-    });
+    }));
   }
 
   create(parent, name) {

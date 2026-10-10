@@ -117,9 +117,9 @@ private fun PocketApp(model: PocketModel, grant: () -> Unit) {
                                 style = MaterialTheme.typography.labelSmall, maxLines = 1,
                                 color = if (state.connected) Color(0xFF16835F) else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        // The figures are three buttons already, each opening its own
-                        // detail. Wrapping them in another chooser only added a tap.
-                        ChatStats(state.chat)
+                        if (tab == 0 && state.viewer == null) {
+                            ChatStats(state.chat)
+                        }
                     }
                 }, navigationIcon = { if (!wide) IconButton(onClick = { scope.launch { drawer.open() } }) { Icon(Icons.Outlined.Menu, tr("工作区与会话")) } },
                     actions = {
@@ -386,6 +386,7 @@ private fun FilesPane(state: PocketState, model: PocketModel, onWorkspace: () ->
             IconButton(onClick = { model.browse(state.browserPath) }) { Icon(Icons.Outlined.Refresh, tr("刷新文件")) }
         }
         if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        state.browserError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         LazyColumn(Modifier.fillMaxSize()) {
             itemsIndexed(state.entries, key = { index, entry -> "${entry.path}_$index" }) { _, entry ->
                 // Runnable files get their own run button, so the file list can
@@ -423,6 +424,7 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
     var saving by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) { model.loadShortcuts() }
+    DisposableEffect(Unit) { onDispose { model.closeWorkspacePicker() } }
     AlertDialog(onDismissRequest = dismiss, title = { Text(tr("选择工作区目录")) }, text = {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             OutlinedTextField(path, { path = it }, label = { Text(tr("目录路径（支持 ~/）")) }, modifier = Modifier.fillMaxWidth(), singleLine = true,
@@ -432,13 +434,13 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
                 items(state.shortcuts, key = { it.path }) { item ->
                     TextButton(onClick = {
                         path = item.path
-                        if (item.available) model.browse(item.path, true)
-                        else checkResult = item.reason.ifBlank { tr("Termux 暂时无法访问，请授权或重新连接存储后刷新。") }
+                        checkResult = item.reason
+                        model.browse(item.path, true)
                     }) { Text(if (item.available) item.label else item.label + tr("（不可访问）")) }
                 }
             }
             Row {
-                TextButton(onClick = { model.loadShortcuts() }) { Text(tr("刷新存储")) }
+                TextButton(onClick = { model.loadShortcuts() }, enabled = !state.shortcutsLoading) { Text(tr("刷新存储")) }
                 TextButton(enabled = path.isNotBlank() && !checking, onClick = {
                     val target = path.trim()
                     checking = true
@@ -453,6 +455,8 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
                 }) { Text(if (checking) tr("验证中…") else tr("验证读写")) }
             }
             if (checkResult.isNotBlank()) Text(checkResult, style = MaterialTheme.typography.bodySmall)
+            if (state.shortcutsLoading) Text(tr("正在检查存储权限…"), style = MaterialTheme.typography.bodySmall)
+            state.shortcutsError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             Text(tr("可选择 SD 卡 / USB 硬盘目录。权限由 Termux 决定；若盘根目录不可写，可尝试 ~/storage/external-1。"), style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { runCatching { TermuxConnection.storageSettings(context) }.onFailure { model.error(it.message ?: tr("无法打开权限设置")) } }) {
                 Text(tr("外接盘无法写入？打开 Termux 权限设置"))
@@ -463,7 +467,8 @@ private fun WorkspaceDialog(state: PocketState, model: PocketModel, dismiss: () 
                 TextButton(onClick = grantStorage) { Text(tr("授权 Termux 存储")) }
             }
             if (state.browserLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (!state.browserLoading && state.entries.isEmpty()) Text(tr("此目录为空或尚未成功打开。"), style = MaterialTheme.typography.bodySmall)
+            state.browserError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            if (!state.browserLoading && state.browserError == null && state.entries.isEmpty()) Text(tr("此目录为空或尚未成功打开。"), style = MaterialTheme.typography.bodySmall)
             if (state.browserTruncated) Text(tr("条目过多，仅显示前一部分。"), style = MaterialTheme.typography.bodySmall)
             LazyColumn(Modifier.height(180.dp)) {
                 itemsIndexed(state.entries.filter { it.directory }, key = { index, entry -> "${entry.path}_$index" }) { _, entry ->
